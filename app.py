@@ -41,7 +41,7 @@ valgt_info = selskaps_data[selected_name]
 ticker_symbol = valgt_info["ticker"]
 
 # Sikker funksjon for å hente KUN kurshistorikk (ingen info-kall!)
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=900)
 def get_historical_data(symbol):
     ticker = yf.Ticker(symbol)
     hist = ticker.history(period="1y")
