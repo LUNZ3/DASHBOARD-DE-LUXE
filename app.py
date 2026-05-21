@@ -1,5 +1,10 @@
 import streamlit as st
 import yfinance as yf
+import yfinance_cache as yfc
+
+# Dette tvinger yfinance til å bruke cachen vi installerte
+yfc.set_metadata_cache_dir('/tmp/yfinance-cache')
+yfc.override_yf()
 import plotly.graph_objects as go
 import pandas as pd
 
