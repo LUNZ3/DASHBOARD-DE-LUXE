@@ -1,12 +1,11 @@
 import streamlit as st
 import yfinance as yf
-import yfinance_cache as yfc
-
-# Dette tvinger yfinance til å bruke cachen vi installerte
-yfc.set_metadata_cache_dir('/tmp/yfinance-cache')
-yfc.override_yf()
 import plotly.graph_objects as go
 import pandas as pd
+
+# Dette fjerner rate-limiten i skyen uten ekstra pakker
+yf.set_tz_cache_location('/tmp/yf-tz-cache')
+
 
 st.set_page_config(page_title="Investor Dashboard - Oslo Børs", layout="wide")
 st.title("📊 Aksjedashboard: Oslo Børs & Makro")
