@@ -3,76 +3,86 @@ import yfinance as yf
 import plotly.graph_objects as go
 import pandas as pd
 
-# Dette fjerner rate-limiten i skyen uten ekstra pakker
+# Hindrer tidssone-kræsj i skyen
 yf.set_tz_cache_location('/tmp/yf-tz-cache')
-
 
 st.set_page_config(page_title="Investor Dashboard - Oslo Børs", layout="wide")
 st.title("📊 Aksjedashboard: Oslo Børs & Makro")
 
-tickers = {
-    "DNO": "DNO.OL",
-    "Endúr": "ENDUR.OL",
-    "Nordic Semiconductor": "NOD.OL",
-    "Brent Oil": "BZ=F"
+# Legg inn selskapsinfo manuelt (Ticker, Fullt navn, og Omsetning i NOK)
+selskaps_data = {
+    "DNO": {
+        "ticker": "DNO.OL",
+        "navn": "DNO ASA",
+        "omsetning": "ca. 13,2 milliarder NOK (2024)"
+    },
+    "Endúr": {
+        "ticker": "ENDUR.OL",
+        "navn": "Endúr ASA",
+        "omsetning": "ca. 2,5 milliarder NOK (2024)"
+    },
+    "Nordic Semiconductor": {
+        "ticker": "NOD.OL",
+        "navn": "Nordic Semiconductor ASA",
+        "omsetning": "ca. 12,8 milliarder NOK (2024)"
+    },
+    "Brent Oil": {
+        "ticker": "BZ=F",
+        "navn": "Brent Crude Oil Future",
+        "omsetning": "N/A (Råvare)"
+    }
 }
 
-selected_name = st.sidebar.selectbox("Velg selskap/data:", list(tickers.keys()))
-ticker_symbol = tickers[selected_name]
+# Sidebar for valg av selskap
+selected_name = st.sidebar.selectbox("Velg selskap/data:", list(selskaps_data.keys()))
 
+# Hent ut infoen basert på valget
+valgt_info = selskaps_data[selected_name]
+ticker_symbol = valgt_info["ticker"]
+
+# Sikker funksjon for å hente KUN kurshistorikk (ingen info-kall!)
 @st.cache_data(ttl=3600)
-def get_data(symbol):
+def get_historical_data(symbol):
     ticker = yf.Ticker(symbol)
     hist = ticker.history(period="1y")
-    info = ticker.info
-    if not hist.empty:
-        hist.index = hist.index.tz_localize(None)
-    return hist, info
+    return hist
 
-hist, info = get_data(ticker_symbol)
-
-if hist.empty:
-    st.error(f"Kunne ikke hente data for {selected_name}.")
-else:
-    currency = info.get("currency", "NOK")
-    col1, col2, col3, col4 = st.columns(4)
-
-    current_price = hist['Close'].iloc[-1]
-    prev_price = hist['Close'].iloc[-2]
-    change = ((current_price - prev_price) / prev_price) * 100
-
+# Prøv å hente historikken
+try:
+    hist = get_historical_data(ticker_symbol)
+    
+    # Vis selskapsinfo øverst i appen
+    st.header(f"{valgt_info['navn']} ({selected_name})")
+    
+    # Lag to kolonner: Én for omsetning/nøkkeltall, én for grafen
+    col1, col2 = st.columns([1, 3])
+    
     with col1:
-        st.metric("Kurs", f"{current_price:.2f} {currency}", f"{change:.2f}%")
+        st.subheader("📋 Selskapsinfo")
+        st.write(f"**Ticker på Børs:** {ticker_symbol}")
+        st.write(f"**Årlig omsetning:** {valgt_info['omsetning']}")
+        
+        if not hist.empty:
+            siste_kurs = hist['Close'].iloc[-1]
+            forrige_kurs = hist['Close'].iloc[-2]
+            endring = siste_kurs - forrige_kurs
+            prosent = (endring / forrige_kurs) * 100
+            st.metric(label="Siste Sluttkurs", value=f"{siste_kurs:.2f}", delta=f"{endring:.2f} ({prosent:.2f}%)")
 
-    if selected_name != "Brent Oil":
-        market_cap = info.get('marketCap')
-        revenue = info.get('totalRevenue')
-        with col2:
-            st.metric("Market Cap", f"{market_cap / 1e9:.2f} mrd" if market_cap else "N/A")
-        with col3:
-            pe = info.get('trailingPE')
-            st.metric("P/E (Trailing)", f"{pe:.2f}" if isinstance(pe, (int, float)) else "N/A")
-        with col4:
-            st.metric("Omsetning (TTM)", f"{revenue / 1e9:.2f} mrd" if revenue else "N/A")
-    else:
-        with col2:
-            st.metric("Type", "Commodity / Makro")
+    with col2:
+        if not hist.empty:
+            st.subheader("📈 Kursutvikling siste år")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=hist.index, y=hist['Close'], mode='lines', name='Sluttkurs', line=dict(color='#00FFCC', width=2)))
+            fig.update_layout(
+                template="plotly_dark",
+                margin=dict(l=20, r=20, t=20, b=20),
+                xaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.1)'),
+                yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.1)')
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("Fant ingen kursdata for dette symbolet akkurat nå.")
 
-    st.subheader(f"Kursutvikling for {selected_name}")
-    fig = go.Figure(data=[go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'])])
-    fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=20, t=20, b=20))
-    st.plotly_chart(fig, use_container_width=True)
-
-    if selected_name != "Brent Oil":
-        st.subheader("Selskapets KPI & Resultat")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.write("**Finansiell oversikt:**")
-            def to_pct(val):
-                return f"{val * 100:.2f}%" if isinstance(val, (int, float)) else "N/A"
-            st.json({
-                "EBITDA Margin": to_pct(info.get("ebitdaMargins")),
-                "Profit Margin": to_pct(info.get("profitMargins")),
-                "Return on Equity": to_pct(info.get("returnOnEquity")),
-                "Dividend Yield": to_pct(info.get("dividendYield"))
-            })
+except Exception as e:
+    st.error(f"Klarte ikke å hente tekniske kursdata: {e}")
