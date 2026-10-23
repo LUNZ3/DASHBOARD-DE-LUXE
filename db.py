@@ -1,11 +1,15 @@
 """STRYKE data layer: SQLite persistence + all business rules (server-side)."""
+import base64
 import hashlib
+import io
 import json
 import math
 import os
 import re
 import secrets
 import sqlite3
+import urllib.parse
+import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -26,6 +30,8 @@ ADMIN_EMAIL = _env("STRYKE_ADMIN_EMAIL", "").strip().lower()
 SPORTS = ["Boxing", "MMA", "Muay Thai", "Kickboxing / K-1", "Brazilian Jiu-Jitsu", "Wrestling"]
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 ACTIVE = ("pending", "confirmed")
+GYM_SPORTS = SPORTS + ["Judo", "Karate", "Taekwondo", "Krav Maga", "Martial arts (general)"]
+CURRENCIES = ["NOK", "SEK", "DKK", "EUR", "GBP", "USD", "THB"]
 
 # name -> (lat, lon, country, tz, currency)  real city-centre coordinates
 CITIES = {
@@ -83,6 +89,19 @@ CREATE TABLE IF NOT EXISTS applications(
 CREATE TABLE IF NOT EXISTS audit_log(
   id INTEGER PRIMARY KEY, actor_id INTEGER, action TEXT NOT NULL, target TEXT, detail TEXT,
   created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS gyms(
+  id INTEGER PRIMARY KEY, osm_id TEXT UNIQUE, name TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL,
+  address TEXT DEFAULT '', city TEXT DEFAULT '', country TEXT DEFAULT '', website TEXT DEFAULT '',
+  phone TEXT DEFAULT '', email TEXT DEFAULT '', sports TEXT NOT NULL DEFAULT '[]', description TEXT DEFAULT '',
+  logo_b64 TEXT DEFAULT '', logo_mime TEXT DEFAULT '',
+  pt_status TEXT NOT NULL DEFAULT 'unknown' CHECK(pt_status IN ('unknown','yes','no')),
+  pt_price_cents INTEGER, currency TEXT DEFAULT '',
+  owner_id INTEGER REFERENCES users(id), claimant_id INTEGER REFERENCES users(id), claim_note TEXT DEFAULT '',
+  claim_status TEXT NOT NULL DEFAULT 'none' CHECK(claim_status IN ('none','pending','approved')),
+  verified INTEGER NOT NULL DEFAULT 0, suspended INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL DEFAULT 'user', created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS ix_gyms_geo ON gyms(lat, lon);
+CREATE TABLE IF NOT EXISTS osm_cache(key TEXT PRIMARY KEY, fetched_at TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0);
 """
 
 
@@ -618,7 +637,7 @@ def review_application(admin, app_id, new_status, note=""):
 
 def set_suspended(admin, kind, target_id, value):
     _require_admin(admin)
-    table = {"coach": "coaches", "user": "users"}[kind]
+    table = {"coach": "coaches", "user": "users", "gym": "gyms"}[kind]
     if kind == "user" and target_id == admin["id"]:
         raise StrykeError("You cannot suspend yourself.")
     with tx() as c:
@@ -647,7 +666,305 @@ def admin_tables(admin):
     with conn() as c:
         return {
             "coaches": [dict(r) for r in c.execute("SELECT id,name,city,verified,demo,suspended FROM coaches")],
+            "gyms": [dict(r) for r in c.execute("SELECT id,name,city,source,pt_status,owner_id,claim_status,verified,suspended FROM gyms ORDER BY id DESC LIMIT 300")],
             "users": [dict(r) for r in c.execute("SELECT id,email,name,suspended,created_at FROM users")],
             "bookings": [dict(r) for r in c.execute("SELECT id,coach_id,user_id,start_utc,status,price_cents,fee_cents,currency,payment_status FROM bookings ORDER BY id DESC LIMIT 200")],
             "audit": [dict(r) for r in c.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 200")],
         }
+
+
+# =========================================================================== GYMS
+# Gyms come from two places: (1) OpenStreetMap, fetched live for the area the visitor looks at
+# (so coverage grows worldwide as people explore), and (2) gyms that owners add/claim themselves,
+# which is the ONLY reliable source for logo, PT status and prices.
+OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"]
+UA = "STRYKE/1.0 (martial arts gym finder)"
+_OSM_SPORT = {
+    "boxing": "Boxing", "mma": "MMA", "muay_thai": "Muay Thai", "thai_boxing": "Muay Thai",
+    "kickboxing": "Kickboxing / K-1", "brazilian_jiu_jitsu": "Brazilian Jiu-Jitsu", "bjj": "Brazilian Jiu-Jitsu",
+    "jiu_jitsu": "Brazilian Jiu-Jitsu", "wrestling": "Wrestling", "judo": "Judo", "karate": "Karate",
+    "taekwondo": "Taekwondo", "krav_maga": "Krav Maga", "martial_arts": "Martial arts (general)",
+    "kung_fu": "Martial arts (general)", "aikido": "Martial arts (general)",
+}
+
+
+def _clean_url(u):
+    u = (u or "").strip()
+    if not u:
+        return ""
+    if not u.lower().startswith(("http://", "https://")):
+        u = "https://" + u
+    return u[:200] if re.match(r"^https?://[^\s<>\"']+$", u) else ""
+
+
+def geocode(q):
+    """Find any place in the world via OpenStreetMap Nominatim. Returns dict or None."""
+    url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(
+        {"q": q, "format": "json", "limit": 1, "addressdetails": 1})
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=10) as r:
+            data = json.loads(r.read().decode())
+    except Exception:
+        raise StrykeError("Place search is unavailable right now. Try again in a moment.")
+    if not data:
+        return None
+    d = data[0]
+    a = d.get("address", {})
+    return {"lat": float(d["lat"]), "lon": float(d["lon"]), "label": d.get("display_name", "")[:120],
+            "city": a.get("city") or a.get("town") or a.get("village") or a.get("municipality") or "",
+            "country": (a.get("country_code") or "").upper()}
+
+
+def _osm_sports(t):
+    out = []
+    for v in (t.get("sport") or "").split(";"):
+        name = _OSM_SPORT.get(v.strip().lower())
+        if name and name not in out:
+            out.append(name)
+    if not out:
+        out = ["Martial arts (general)"]
+    return out
+
+
+def fetch_osm(lat, lon, radius_km=15, force=False):
+    """Load martial-arts gyms around a point from OpenStreetMap into the local table. Cached 7 days per area."""
+    radius_km = max(1, min(float(radius_km), 50))
+    key = f"{lat:.2f}:{lon:.2f}:{int(radius_km)}"
+    with conn() as c:
+        row = c.execute("SELECT fetched_at FROM osm_cache WHERE key=?", (key,)).fetchone()
+    if row and not force and (datetime.now(timezone.utc) - _p(row["fetched_at"])).days < 7:
+        return 0
+    r = int(radius_km * 1000)
+    sp = "boxing|martial_arts|mma|muay_thai|thai_boxing|kickboxing|judo|karate|taekwondo|wrestling|jiu_jitsu|brazilian_jiu_jitsu|bjj|krav_maga|kung_fu|aikido"
+    q = (f'[out:json][timeout:30];(nwr["sport"~"{sp}"](around:{r},{lat},{lon});'
+         f'nwr["amenity"="dojo"](around:{r},{lat},{lon}););out center tags 600;')
+    payload = urllib.parse.urlencode({"data": q}).encode()
+    data = None
+    for ep in OVERPASS:
+        try:
+            with urllib.request.urlopen(urllib.request.Request(ep, data=payload, headers={"User-Agent": UA}), timeout=45) as resp:
+                data = json.loads(resp.read().decode())
+                break
+        except Exception:
+            continue
+    if data is None:
+        raise StrykeError("Could not reach OpenStreetMap right now. Showing gyms already saved.")
+    n = 0
+    with tx() as c:
+        for el in data.get("elements", []):
+            t = el.get("tags", {})
+            name = (t.get("name") or "").strip()
+            if not name:
+                continue
+            if el.get("type") == "node":
+                la, lo = el.get("lat"), el.get("lon")
+            else:
+                ctr = el.get("center") or {}
+                la, lo = ctr.get("lat"), ctr.get("lon")
+            if la is None or lo is None:
+                continue
+            street = f"{t.get('addr:street', '')} {t.get('addr:housenumber', '')}".strip()
+            addr = ", ".join(x for x in (street, t.get("addr:postcode", ""), t.get("addr:city", "")) if x)[:200]
+            vals = (name[:120], la, lo, addr, (t.get("addr:city") or "")[:80],
+                    _clean_url(t.get("website") or t.get("contact:website") or ""),
+                    (t.get("phone") or t.get("contact:phone") or "")[:40], json.dumps(_osm_sports(t)))
+            oid = f"{el['type']}/{el['id']}"
+            c.execute("INSERT OR IGNORE INTO gyms(name,lat,lon,address,city,website,phone,sports,osm_id,source,created_at)"
+                      " VALUES(?,?,?,?,?,?,?,?,?,'osm',?)", (*vals, oid, now_iso()))
+            c.execute("UPDATE gyms SET name=?,lat=?,lon=?,address=?,city=?,website=?,phone=?,sports=?"
+                      " WHERE osm_id=? AND owner_id IS NULL", (*vals, oid))
+            n += 1
+        c.execute("INSERT OR REPLACE INTO osm_cache(key,fetched_at,n) VALUES(?,?,?)", (key, now_iso(), n))
+    return n
+
+
+def _gym_dict(r):
+    d = dict(r)
+    d["sports"] = json.loads(d["sports"] or "[]")
+    return d
+
+
+def get_gym(gid):
+    if not gid:
+        return None
+    with conn() as c:
+        r = c.execute("SELECT * FROM gyms WHERE id=?", (gid,)).fetchone()
+    return _gym_dict(r) if r else None
+
+
+def gyms_near(lat, lon, radius_km=15, sports=None, pt_only=False, q=""):
+    dlat = radius_km / 111.0
+    dlon = radius_km / (111.0 * max(math.cos(math.radians(lat)), 0.1))
+    with conn() as c:
+        rows = c.execute("SELECT * FROM gyms WHERE suspended=0 AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?",
+                         (lat - dlat, lat + dlat, lon - dlon, lon + dlon)).fetchall()
+    out = []
+    for r in rows:
+        d = _gym_dict(r)
+        d["distance_km"] = haversine_km(lat, lon, d["lat"], d["lon"])
+        if d["distance_km"] > radius_km:
+            continue
+        if q and q.lower() not in f"{d['name']} {d['city']} {d['address']}".lower():
+            continue
+        if sports and not set(sports) & set(d["sports"]):
+            continue
+        if pt_only and d["pt_status"] != "yes":
+            continue
+        out.append(d)
+    out.sort(key=lambda d: (d["pt_status"] != "yes", d["distance_km"]))
+    return out
+
+
+def _logo(logo):
+    """logo = (filename, bytes). Re-encoded to a small PNG so uploads cannot carry scripts/huge files."""
+    if not logo:
+        return None
+    name, blob = logo
+    if len(blob) > 3 * 1024 * 1024:
+        raise StrykeError("Logo is larger than 3 MB.")
+    if not name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+        raise StrykeError("Logo must be PNG, JPG or WEBP.")
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(blob))
+        im.load()
+        im.thumbnail((256, 256))
+        buf = io.BytesIO()
+        im.convert("RGBA").save(buf, "PNG")
+    except Exception:
+        raise StrykeError("Could not read that image file.")
+    return base64.b64encode(buf.getvalue()).decode(), "image/png"
+
+
+def _gym_fields(d):
+    name = d["name"].strip()
+    if len(name) < 2:
+        raise StrykeError("Enter the gym name.")
+    sports = [s for s in d["sports"] if s in GYM_SPORTS]
+    if not sports:
+        raise StrykeError("Select at least one martial art.")
+    pt = d.get("pt_status", "unknown")
+    if pt not in ("yes", "no", "unknown"):
+        raise StrykeError("Choose whether PT is offered.")
+    price = int(d.get("price") or 0)
+    cur = d.get("currency", "")
+    if price < 0:
+        raise StrykeError("Price cannot be negative.")
+    if pt != "yes":
+        price = 0
+    if price and cur not in CURRENCIES:
+        raise StrykeError("Choose a currency.")
+    raw_site = (d.get("website") or "").strip()
+    site = _clean_url(raw_site)
+    if raw_site and not site:
+        raise StrykeError("The website address looks invalid.")
+    email = (d.get("email") or "").strip()
+    if email and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        raise StrykeError("The contact email looks invalid.")
+    return {"name": name[:120], "address": (d.get("address") or "").strip()[:200], "city": (d.get("city") or "").strip()[:80],
+            "website": site, "phone": (d.get("phone") or "").strip()[:40], "email": email[:120],
+            "sports": json.dumps(sports), "description": (d.get("description") or "").strip()[:1000],
+            "pt_status": pt, "pt_price_cents": price * 100 if price else None, "currency": cur if price else ""}
+
+
+def _place_gym(address, city):
+    q = ", ".join(x for x in (address.strip(), city.strip()) if x)
+    if not q:
+        raise StrykeError("Enter a street address or city so the gym can be placed on the map.")
+    g = geocode(q)
+    if not g:
+        raise StrykeError("Could not find that address on the map. Check the spelling or add city and country.")
+    return g
+
+
+def create_gym(uid, d, logo=None):
+    """d may include lat/lon to skip address lookup. Owner-created gyms are owned immediately (not verified)."""
+    f = _gym_fields(d)
+    lg = _logo(logo)
+    if d.get("lat") is not None and d.get("lon") is not None:
+        lat, lon, country = float(d["lat"]), float(d["lon"]), d.get("country", "")
+    else:
+        g = _place_gym(f["address"], f["city"])
+        lat, lon, country = g["lat"], g["lon"], g["country"]
+        f["city"] = f["city"] or g["city"]
+    with tx() as c:
+        if c.execute("SELECT COUNT(*) FROM gyms WHERE owner_id=?", (uid,)).fetchone()[0] >= 5:
+            raise StrykeError("You can list up to 5 gyms per account.")
+        cur = c.execute(
+            "INSERT INTO gyms(name,lat,lon,address,city,country,website,phone,email,sports,description,logo_b64,logo_mime,"
+            "pt_status,pt_price_cents,currency,owner_id,claim_status,source,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'approved','user',?)",
+            (f["name"], lat, lon, f["address"], f["city"], country, f["website"], f["phone"], f["email"], f["sports"],
+             f["description"], lg[0] if lg else "", lg[1] if lg else "", f["pt_status"], f["pt_price_cents"], f["currency"],
+             uid, now_iso()))
+        gid = cur.lastrowid
+        audit(c, {"id": uid}, "gym_created", gid)
+    return gid
+
+
+def update_gym(uid, gid, d, logo=None, remove_logo=False):
+    old = get_gym(gid)
+    if not old or old["owner_id"] != uid:
+        raise PermissionError("You do not own this gym.")
+    f = _gym_fields(d)
+    if (f["address"], f["city"]) != (old["address"], old["city"]):
+        g = _place_gym(f["address"], f["city"])
+        f["lat"], f["lon"], f["country"] = g["lat"], g["lon"], g["country"]
+    lg = _logo(logo)
+    if lg:
+        f["logo_b64"], f["logo_mime"] = lg
+    elif remove_logo:
+        f["logo_b64"], f["logo_mime"] = "", ""
+    with tx() as c:
+        c.execute(f"UPDATE gyms SET {', '.join(k + '=?' for k in f)} WHERE id=? AND owner_id=?", (*f.values(), gid, uid))
+        audit(c, {"id": uid}, "gym_updated", gid)
+
+
+def user_gyms(uid):
+    with conn() as c:
+        return [_gym_dict(r) for r in c.execute(
+            "SELECT * FROM gyms WHERE owner_id=? OR (claimant_id=? AND claim_status='pending') ORDER BY id DESC", (uid, uid))]
+
+
+def claim_gym(uid, gid, note=""):
+    """Ask to become the owner of a gym listed from OpenStreetMap. An admin must approve."""
+    if len(note.strip()) < 5:
+        raise StrykeError("Tell the reviewer how you are connected to this gym (role, website, work email).")
+    with tx() as c:
+        g = c.execute("SELECT * FROM gyms WHERE id=?", (gid,)).fetchone()
+        if not g:
+            raise StrykeError("Gym not found.")
+        if g["owner_id"]:
+            raise StrykeError("This gym already has an owner.")
+        if g["claim_status"] == "pending":
+            raise StrykeError("A claim for this gym is already waiting for review.")
+        c.execute("UPDATE gyms SET claim_status='pending', claimant_id=?, claim_note=? WHERE id=?", (uid, note.strip()[:500], gid))
+        audit(c, {"id": uid}, "gym_claim_requested", gid, note[:200])
+
+
+def list_claims(admin):
+    _require_admin(admin)
+    with conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT g.id,g.name,g.city,g.website,g.claim_note,u.email FROM gyms g JOIN users u ON u.id=g.claimant_id "
+            "WHERE g.claim_status='pending' ORDER BY g.id")]
+
+
+def review_claim(admin, gid, approve):
+    _require_admin(admin)
+    with tx() as c:
+        g = c.execute("SELECT * FROM gyms WHERE id=?", (gid,)).fetchone()
+        if not g or g["claim_status"] != "pending":
+            raise StrykeError("No pending claim for this gym.")
+        if approve:
+            c.execute("UPDATE gyms SET owner_id=claimant_id, claim_status='approved' WHERE id=?", (gid,))
+        else:
+            c.execute("UPDATE gyms SET claim_status='none', claimant_id=NULL WHERE id=?", (gid,))
+        audit(c, admin, "gym_claim_approved" if approve else "gym_claim_rejected", gid)
+
+
+def set_gym_verified(admin, gid, value):
+    _require_admin(admin)
+    with tx() as c:
+        c.execute("UPDATE gyms SET verified=? WHERE id=?", (1 if value else 0, gid))
+        audit(c, admin, "gym_verified" if value else "gym_unverified", gid)
