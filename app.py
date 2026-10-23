@@ -64,7 +64,9 @@ st.set_page_config(page_title="STRYKE", page_icon="🥊", layout="wide")
 db.init()
 st.markdown(CSS, unsafe_allow_html=True)
 ss = st.session_state
-for k, v in {"page": "home", "uid": None, "coach_id": None, "origin": None, "gps_ask": False}.items():
+for k, v in {"page": "home", "uid": None, "coach_id": None, "origin": None, "gps_ask": False, "gym_id": None,
+             "map_center": (59.9139, 10.7522), "map_label": "Oslo", "map_zoom": 11, "view_center": None,
+             "last_fetch": None, "sel": None, "gps_map": False, "view_zoom": None}.items():
     ss.setdefault(k, v)
 
 user = db.get_user(ss.uid)  # re-read every run so suspensions apply immediately
@@ -74,10 +76,12 @@ my_coach = db.coach_for_user(user["id"]) if user else None
 e = html.escape
 
 
-def nav(page, coach_id=None):
+def nav(page, coach_id=None, gym_id=None):
     ss.page = page
     if coach_id is not None:
         ss.coach_id = coach_id
+    if gym_id is not None:
+        ss.gym_id = gym_id
 
 
 def local(dt_utc, tz):
@@ -107,26 +111,26 @@ def stars(c):
 
 # ------------------------------------------------------------------ header
 def header():
-    cols = st.columns([2.2, 1, 1, 1, 1.2])
+    cols = st.columns([1.8, 1, 1, 1.1, 1, 1.4])
     cols[0].markdown('<div class="brand">STRY<b>K</b>E</div>', unsafe_allow_html=True)
     cols[1].button("Find a coach", on_click=nav, args=("coaches",), use_container_width=True)
-    cols[2].button("Become a coach", on_click=nav, args=("apply",), use_container_width=True)
+    cols[2].button("Gym map", on_click=nav, args=("gyms",), use_container_width=True, key="hg")
+    cols[3].button("Become a coach", on_click=nav, args=("apply",), use_container_width=True)
     if user:
-        cols[3].button("My bookings", on_click=nav, args=("dashboard",), use_container_width=True)
+        cols[4].button("My bookings", on_click=nav, args=("dashboard",), use_container_width=True)
         lbl = user["name"].split()[0]
-        cols[4].button(f"Account · {lbl}", on_click=nav, args=("account",), use_container_width=True)
+        cols[5].button(f"Account · {lbl}", on_click=nav, args=("account",), use_container_width=True)
     else:
-        cols[3].write("")
-        cols[4].button("Log in / Sign up", on_click=nav, args=("account",), type="primary", use_container_width=True)
-    extra = []
+        cols[4].write("")
+        cols[5].button("Log in / Sign up", on_click=nav, args=("account",), type="primary", use_container_width=True)
+    extra = [("List your gym", "gym_manage")]
     if my_coach:
         extra.append(("Coach dashboard", "coach_dash"))
     if db.is_admin(user):
         extra.append(("Admin", "admin"))
-    if extra:
-        ec = st.columns(len(extra) + 4)
-        for i, (lbl, p) in enumerate(extra):
-            ec[i].button(lbl, on_click=nav, args=(p,), key=f"x_{p}", use_container_width=True)
+    ec = st.columns(len(extra) + 4)
+    for i, (lbl, p) in enumerate(extra):
+        ec[i].button(lbl, on_click=nav, args=(p,), key=f"x_{p}", use_container_width=True)
 
 
 def coach_card(c, key, fav_ids=()):
@@ -152,9 +156,10 @@ def page_home():
         '<h1>Find your coach.<br><em>Train like a fighter.</em></h1>'
         '<p>Book experienced boxing, MMA, Muay Thai, kickboxing, BJJ and wrestling coaches near you. '
         'Compare real credentials, pick a time, train.</p></div>', unsafe_allow_html=True)
-    a, b, _ = st.columns([1, 1, 3])
+    a, b, b2, _ = st.columns([1, 1, 1, 2])
     a.button("Find a coach", type="primary", on_click=nav, args=("coaches",), use_container_width=True, key="h1")
-    b.button("Become a coach", on_click=nav, args=("apply",), use_container_width=True, key="h2")
+    b.button("Open gym map", on_click=nav, args=("gyms",), use_container_width=True, key="h3")
+    b2.button("Become a coach", on_click=nav, args=("apply",), use_container_width=True, key="h2")
 
     st.markdown("### Sports")
     st.markdown("".join(f'<span class="chip acc">{e(s)}</span>' for s in db.SPORTS) + '<span class="chip">+ more coming</span>',
@@ -228,7 +233,7 @@ def page_coaches():
 
     res = db.search_coaches(q, sports, "" if city == "Anywhere" else city, max_price, min_years,
                             "" if language == "Any" else language, min_rating, only_av, ss.origin, sort)
-    st.caption(f"{len(res)} coach{'es' if len(res) != 1 else ''} found · list view (map needs a map provider, see README)")
+    st.caption(f"{len(res)} coach{'es' if len(res) != 1 else ''} found · see them on the interactive Gym map too")
     if not res:
         st.info("No coaches match these filters. Try widening them.")
     favs = db.favourite_ids(user["id"]) if user else set()
@@ -500,7 +505,7 @@ def page_admin():
         st.error("Not authorised.")
         return
     st.markdown("## Admin")
-    t = st.tabs(["Applications", "Metrics", "Coaches & users", "Bookings", "Audit log"])
+    t = st.tabs(["Applications", "Metrics", "Coaches & users", "Bookings", "Audit log", "Gyms"])
     with t[0]:
         apps = db.list_applications(user)
         if not apps:
@@ -539,6 +544,362 @@ def page_admin():
         st.dataframe(tb["bookings"])
     with t[4]:
         st.dataframe(tb["audit"])
+    with t[5]:
+        st.markdown("#### Pending ownership claims")
+        claims = db.list_claims(user)
+        if not claims:
+            st.info("No pending claims.")
+        for cl in claims:
+            with st.container(border=True):
+                st.markdown(f"**#{cl['id']} {e(cl['name'])}** · {e(cl['city'] or '')} · claimant: {e(cl['email'])}")
+                st.caption(f"Gym website: {cl['website'] or '—'}  |  Claimant says: {cl['claim_note']}")
+                g1, g2 = st.columns(2)
+                if g1.button("Approve claim", key=f"ca{cl['id']}"):
+                    db.review_claim(user, cl["id"], True)
+                    st.rerun()
+                if g2.button("Reject claim", key=f"cr{cl['id']}"):
+                    db.review_claim(user, cl["id"], False)
+                    st.rerun()
+        st.markdown("#### All gyms")
+        st.dataframe(tb["gyms"])
+        gid = st.number_input("Gym id", 1, 10000000, 1, key="adm_gid")
+        q1, q2, q3, q4 = st.columns(4)
+        if q1.button("Verify gym"):
+            db.set_gym_verified(user, int(gid), True)
+            st.rerun()
+        if q2.button("Unverify gym"):
+            db.set_gym_verified(user, int(gid), False)
+            st.rerun()
+        if q3.button("Hide gym"):
+            db.set_suspended(user, "gym", int(gid), True)
+            st.rerun()
+        if q4.button("Unhide gym"):
+            db.set_suspended(user, "gym", int(gid), False)
+            st.rerun()
+
+
+# --------------------------------------------------------------- gym map
+def logo_img(g, size=48):
+    if g.get("logo_b64"):
+        return (f'<img src="data:{e(g["logo_mime"])};base64,{g["logo_b64"]}" alt="logo" '
+                f'style="width:{size}px;height:{size}px;border-radius:12px;object-fit:cover;float:left;margin-right:.8rem;background:#000">')
+    return (f'<div class="avatar" style="width:{size}px;height:{size}px;font-size:{size * 0.4:.0f}px">'
+            f'{e(initials(g["name"]) or "?")}</div>')
+
+
+def pt_label(g):
+    if g["pt_status"] == "yes":
+        return f"PT from {db.money(g['pt_price_cents'], g['currency'])}" if g.get("pt_price_cents") else "PT offered · ask the gym for price"
+    return "No PT" if g["pt_status"] == "no" else "PT: not confirmed"
+
+
+def gym_badges(g):
+    out = []
+    if g["pt_status"] == "yes":
+        out.append('<span class="badge-ok">PT</span>')
+    if g.get("verified"):
+        out.append('<span class="badge-ok">✓ VERIFIED GYM</span>')
+    if not g.get("owner_id"):
+        out.append('<span class="badge-no">From OpenStreetMap · unclaimed</span>')
+    return " ".join(out)
+
+
+def gym_card(g, key):
+    dist = f" · {g['distance_km']:.1f} km" if g.get("distance_km") is not None else ""
+    chips = "".join(f'<span class="chip">{e(x)}</span>' for x in g["sports"][:4])
+    st.markdown(
+        f'<div class="card">{logo_img(g)}<h4>{e(g["name"])}</h4>'
+        f'<div class="muted">{e(g["city"] or g["address"] or "")}{dist}</div>'
+        f'<div style="clear:both;margin:.5rem 0">{gym_badges(g)}</div>{chips}'
+        f'<div style="margin-top:.6rem;font-weight:800">{e(pt_label(g))}</div></div>', unsafe_allow_html=True)
+    st.button("View gym", key=f"g_{key}_{g['id']}", on_click=nav, args=("gym", None, g["id"]), use_container_width=True)
+
+
+def _zoom_for(r):
+    return 13 if r <= 3 else 12 if r <= 7 else 11 if r <= 15 else 10 if r <= 30 else 9
+
+
+def page_gyms():
+    try:
+        import folium
+        from folium.plugins import MarkerCluster
+        from streamlit_folium import st_folium
+    except ImportError:
+        st.error("Map components are missing. Make sure requirements.txt contains folium and streamlit-folium.")
+        return
+
+    st.markdown("## Gym map")
+    st.caption("Drag to move, scroll or pinch to zoom, click a dot for details. Gyms are loaded from OpenStreetMap for the area you look "
+               "at, so search any place in the world. Logo, PT and price only appear when the gym itself has added them.")
+
+    def recenter(la, lo, label):
+        ss.map_center, ss.map_label, ss.last_fetch = (la, lo), label, None
+        ss.view_center, ss.view_zoom = None, None
+
+    # ---- where to look
+    with st.form("placeform", border=False):
+        pc = st.columns([3, 1])
+        place = pc[0].text_input("Search any place in the world", placeholder="Bangkok · Rio de Janeiro · Karl Johans gate, Oslo",
+                                 label_visibility="collapsed")
+        go = pc[1].form_submit_button("🔍 Search", type="primary", use_container_width=True)
+    lc = st.columns([1.3, 1.5, 2])
+    if lc[0].button("📍 Use my location (GPS)"):
+        ss.gps_map = True
+    if ss.gps_map:
+        try:
+            from streamlit_js_eval import get_geolocation
+            g = get_geolocation()
+            if g and "coords" in g:
+                recenter(g["coords"]["latitude"], g["coords"]["longitude"], "your GPS position")
+                ss.gps_map = False
+                st.rerun()
+            elif g and "error" in g:
+                st.warning("Location permission denied or unavailable. Search a place instead.")
+                ss.gps_map = False
+            else:
+                st.info("Waiting for browser location permission…")
+        except Exception:
+            st.warning("GPS component unavailable. Search a place instead.")
+            ss.gps_map = False
+    quick = lc[1].selectbox("Quick jump", ["—"] + list(db.CITIES), label_visibility="collapsed")
+    if quick != "—" and quick != ss.get("_quick_prev"):
+        ss._quick_prev = quick
+        recenter(*db.CITIES[quick][:2], quick)
+    if go and place.strip():
+        try:
+            hit = db.geocode(place.strip())
+            if hit:
+                recenter(hit["lat"], hit["lon"], hit["label"])
+            else:
+                st.warning("Could not find that place. Try a bigger city or add the country.")
+        except db.StrykeError as ex:
+            st.warning(str(ex))
+    lc[2].caption(f"Centered on: {ss.map_label}")
+
+    # ---- filters
+    f = st.columns([1.2, 1.5, 1.2, 1, 1])
+    radius = f[0].slider("Radius (km)", 2, 50, 15)
+    sports = f[1].multiselect("Martial art", db.GYM_SPORTS)
+    qtxt = f[2].text_input("Name filter", placeholder="gym name…")
+    pt_only = f[3].checkbox("Only gyms with PT", value=False)
+    show_coaches = f[4].checkbox("Show coaches", value=True)
+
+    lat, lon = ss.map_center
+    key = (round(lat, 2), round(lon, 2), radius)
+    if ss.last_fetch != key:
+        ss.last_fetch = key
+        try:
+            with st.spinner("Loading gyms from OpenStreetMap…"):
+                db.fetch_osm(lat, lon, radius)
+        except db.StrykeError as ex:
+            st.warning(str(ex))
+    rb = st.columns([1.4, 1.6, 3])
+    if rb[0].button("🔄 Reload this area"):
+        try:
+            with st.spinner("Reloading…"):
+                db.fetch_osm(lat, lon, radius, force=True)
+        except db.StrykeError as ex:
+            st.warning(str(ex))
+    if rb[1].button("🎯 Search where the map is now") and ss.view_center:
+        recenter(ss.view_center[0], ss.view_center[1], "map view")
+        st.rerun()
+
+    gyms = db.gyms_near(lat, lon, radius, sports, pt_only, qtxt)
+    coaches = []
+    if show_coaches:
+        coaches = [c for c in db.search_coaches(sports=[x for x in sports if x in db.SPORTS] or None)
+                   if db.haversine_km(lat, lon, c["lat"], c["lon"]) <= radius]
+
+    # ---- map
+    m = folium.Map(location=[lat, lon], zoom_start=_zoom_for(radius), tiles=None, control_scale=True, scrollWheelZoom=True)
+    folium.TileLayer(tiles="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", name="Dark",
+                     attr="© OpenStreetMap contributors © CARTO", subdomains="abcd", max_zoom=19).add_to(m)
+    folium.TileLayer(tiles="OpenStreetMap", name="Street map").add_to(m)
+    folium.Circle([lat, lon], radius=radius * 1000, color=ACCENT, weight=1, fill=False, dash_array="6").add_to(m)
+    folium.CircleMarker([lat, lon], radius=5, color="#fff", fill=True, fill_color="#fff", tooltip="Search centre").add_to(m)
+    cluster = MarkerCluster(name="Gyms").add_to(m)
+    for g in gyms[:600]:
+        col = ACCENT if g["pt_status"] == "yes" else "#6E6E78"
+        site = f'<br><a href="{e(g["website"])}" target="_blank" rel="noopener">Website</a>' if g["website"] else ""
+        pop = (f'<div style="font-family:sans-serif;min-width:190px;color:#111;overflow:auto">{logo_img(g, 44)}'
+               f'<b>{e(g["name"])}</b><br>{e(pt_label(g))}<br><small>{e(", ".join(g["sports"][:4]))}</small>{site}</div>')
+        folium.CircleMarker([g["lat"], g["lon"]], radius=10 if g["pt_status"] == "yes" else 7, color="#000", weight=1, fill=True,
+                            fill_color=col, fill_opacity=.95, tooltip=g["name"],
+                            popup=folium.Popup(pop, max_width=280)).add_to(cluster)
+    for c in coaches:
+        pop = (f'<div style="font-family:sans-serif;color:#111"><b>{e(c["name"])}</b><br>Coach · '
+               f'{e(db.money(c["price_cents"], c["currency"]))} / {c["session_minutes"]} min<br><small>{e(", ".join(c["sports"]))}</small></div>')
+        folium.CircleMarker([c["lat"], c["lon"]], radius=8, color="#fff", weight=2, fill=True, fill_color="#FF2E63", fill_opacity=.95,
+                            tooltip=f"Coach: {c['name']}", popup=folium.Popup(pop, max_width=260)).add_to(m)
+    folium.LayerControl(collapsed=True).add_to(m)
+
+    opts = dict(key="gymmap", height=560, returned_objects=["last_object_clicked", "center", "zoom"])
+    if ss.view_center and ss.view_zoom:  # keep the visitor's own pan/zoom across reruns
+        opts.update(center=ss.view_center, zoom=ss.view_zoom)
+    try:
+        ret = st_folium(m, use_container_width=True, **opts)
+    except TypeError:
+        ret = st_folium(m, width=1100, **opts)
+    st.markdown(f'<span class="chip acc">● PT confirmed</span><span class="chip">● PT not confirmed</span>'
+                f'<span class="chip" style="border-color:#FF2E63;color:#FF2E63">● Coach</span>'
+                f'<span class="muted"> {len(gyms)} gyms · {len(coaches)} coaches within {radius} km</span>', unsafe_allow_html=True)
+
+    if ret:
+        ctr = ret.get("center")
+        if ctr:
+            ss.view_center = (ctr["lat"], ctr["lng"])
+        if ret.get("zoom"):
+            ss.view_zoom = ret["zoom"]
+        lc_ = ret.get("last_object_clicked")
+        if lc_:
+            best, bd = None, 0.08
+            for kind, items in (("gym", gyms), ("coach", coaches)):
+                for it in items:
+                    d = db.haversine_km(lc_["lat"], lc_["lng"], it["lat"], it["lng"])
+                    if d < bd:
+                        best, bd = (kind, it["id"]), d
+            if best:
+                ss.sel = best
+
+    sel = ss.sel
+    if sel and sel[0] == "gym":
+        g = db.get_gym(sel[1])
+        if g:
+            st.markdown("### Selected")
+            gym_card(g, "sel")
+    elif sel and sel[0] == "coach":
+        c = db.get_coach(sel[1])
+        if c:
+            st.markdown("### Selected")
+            coach_card(c, "sel")
+
+    st.markdown("### Gyms in this area")
+    if not gyms:
+        st.info("No gyms found here yet. Try a larger radius, another place, or add your own gym with “List your gym”.")
+    shown = gyms[:60]
+    for i in range(0, len(shown), 3):
+        for col, g in zip(st.columns(3), shown[i:i + 3]):
+            with col:
+                gym_card(g, f"l{i}")
+    if len(gyms) > len(shown):
+        st.caption(f"Showing the nearest {len(shown)} of {len(gyms)}. Narrow the filters to see others.")
+
+
+def page_gym():
+    g = db.get_gym(ss.gym_id)
+    if not g or g["suspended"]:
+        st.error("Gym not found.")
+        return
+    st.button("← Back to map", on_click=nav, args=("gyms",))
+    st.markdown(f'{logo_img(g, 84)}<h1 style="margin:0">{e(g["name"])}</h1>'
+                f'<div class="muted">{e(g["address"] or "")} {e(g["city"] or "")} {e(g["country"] or "")}</div>'
+                f'<div style="clear:both;margin:.5rem 0 1rem">{gym_badges(g)}</div>', unsafe_allow_html=True)
+    left, right = st.columns([2, 1.2])
+    with left:
+        st.markdown("".join(f'<span class="chip acc">{e(x)}</span>' for x in g["sports"]), unsafe_allow_html=True)
+        st.write(g["description"] or "No description yet.")
+        st.markdown("### Contact")
+        if g["phone"]:
+            st.markdown(f"**Phone:** {e(g['phone'])}")
+        if g["email"]:
+            st.markdown(f"**Email:** {e(g['email'])}")
+        if not (g["phone"] or g["email"] or g["website"]):
+            st.caption("No contact details listed yet.")
+        b = st.columns(2)
+        if g["website"]:
+            b[0].link_button("Website", g["website"], use_container_width=True)
+        b[1].link_button("Directions", f"https://www.google.com/maps/dir/?api=1&destination={g['lat']},{g['lon']}", use_container_width=True)
+        import pandas as pd
+        st.map(pd.DataFrame({"lat": [g["lat"]], "lon": [g["lon"]]}), zoom=14)
+    with right:
+        price = (f'<div class="num">{db.money(g["pt_price_cents"], g["currency"])}</div><div class="muted">per personal-training session</div>'
+                 if g["pt_status"] == "yes" and g.get("pt_price_cents") else
+                 f'<div class="num" style="font-size:1.4rem">{e(pt_label(g))}</div>')
+        st.markdown(f'<div class="card">{price}</div>', unsafe_allow_html=True)
+        if not g["owner_id"]:
+            st.markdown('<div class="banner">This listing comes from OpenStreetMap. The gym has not added its own logo, PT status or prices yet.</div>',
+                        unsafe_allow_html=True)
+        if user and g["owner_id"] == user["id"]:
+            st.success("You manage this gym.")
+            st.button("Edit gym", on_click=nav, args=("gym_manage",), type="primary", use_container_width=True)
+        elif not g["owner_id"]:
+            st.markdown("#### Is this your gym?")
+            if g["claim_status"] == "pending":
+                st.info("A claim is waiting for admin review.")
+            elif not user:
+                st.button("Log in to claim", on_click=nav, args=("account",), key="clg")
+            else:
+                note = st.text_area("How are you connected to this gym? (role, website, work email)", max_chars=500, key="claimnote")
+                if st.button("Claim this gym", type="primary", use_container_width=True):
+                    try:
+                        db.claim_gym(user["id"], g["id"], note)
+                        st.success("Claim sent. An administrator will review it.")
+                        st.rerun()
+                    except db.StrykeError as ex:
+                        st.error(str(ex))
+
+
+def gym_form(g, key):
+    d = g or {}
+    with st.form(key):
+        name = st.text_input("Gym / club name", d.get("name", ""))
+        c1, c2 = st.columns(2)
+        address = c1.text_input("Street address", d.get("address", ""))
+        city = c2.text_input("City", d.get("city", ""))
+        c3, c4, c5 = st.columns(3)
+        website = c3.text_input("Website", d.get("website", ""))
+        phone = c4.text_input("Phone", d.get("phone", ""))
+        email = c5.text_input("Contact email (shown publicly)", d.get("email", ""))
+        sports = st.multiselect("Martial arts offered", db.GYM_SPORTS, d.get("sports", []))
+        desc = st.text_area("About the gym", d.get("description", ""), max_chars=1000)
+        pts = ["yes", "no", "unknown"]
+        pt = st.radio("Do you offer personal training (PT) in martial arts?", pts, index=pts.index(d.get("pt_status", "unknown")),
+                      format_func={"yes": "Yes, PT offered", "no": "No", "unknown": "Not sure / not shown"}.get, horizontal=True)
+        p1, p2 = st.columns(2)
+        price = p1.number_input("PT price per session (0 = ask the gym)", 0, 100000, int((d.get("pt_price_cents") or 0) // 100))
+        cur = d.get("currency") or "NOK"
+        curr = p2.selectbox("Currency", db.CURRENCIES, db.CURRENCIES.index(cur) if cur in db.CURRENCIES else 0)
+        logo = st.file_uploader("Club logo (PNG / JPG / WEBP)", type=["png", "jpg", "jpeg", "webp"])
+        rm = st.checkbox("Remove current logo") if d.get("logo_b64") else False
+        if st.form_submit_button("Save gym" if g else "Add gym", type="primary"):
+            data = dict(name=name, address=address, city=city, website=website, phone=phone, email=email, sports=sports,
+                        description=desc, pt_status=pt, price=price, currency=curr)
+            blob = (logo.name, logo.getvalue()) if logo else None
+            try:
+                if g:
+                    db.update_gym(user["id"], g["id"], data, blob, rm)
+                    st.success("Saved.")
+                else:
+                    gid = db.create_gym(user["id"], data, blob)
+                    st.success("Gym added to the map.")
+                    ss.gym_id = gid
+            except (db.StrykeError, PermissionError) as ex:
+                st.error(str(ex))
+
+
+def page_gym_manage():
+    st.markdown("## List your gym")
+    st.caption("Add your gym to the map with logo, martial arts and PT price. Listings are shown publicly. A ✓ verified badge is only given by a STRYKE administrator.")
+    if not user:
+        st.info("Log in or create an account first.")
+        st.button("Log in / Sign up", on_click=nav, args=("account",), key="gm1")
+        return
+    mine = db.user_gyms(user["id"])
+    t1, t2 = st.tabs(["My gyms", "Add a new gym"])
+    with t1:
+        owned = [g for g in mine if g["owner_id"] == user["id"]]
+        pend = [g for g in mine if g["owner_id"] != user["id"]]
+        for g in pend:
+            st.info(f"Claim for “{g['name']}” is waiting for admin review.")
+        if not owned:
+            st.caption("You have no gyms yet. Add one, or open a gym on the map and press “Claim this gym”.")
+        else:
+            sel = st.selectbox("Choose gym", [g["id"] for g in owned], format_func=lambda i: next(x["name"] for x in owned if x["id"] == i))
+            g = db.get_gym(sel)
+            st.button("View public page", on_click=nav, args=("gym", None, sel), key="gm2")
+            gym_form(g, f"edit{sel}")
+    with t2:
+        gym_form(None, "newgym")
 
 
 def page_legal():
@@ -552,7 +913,8 @@ def page_legal():
 
 header()
 {"home": page_home, "coaches": page_coaches, "profile": page_profile, "account": page_account, "dashboard": page_dashboard,
- "apply": page_apply, "coach_dash": page_coach_dash, "admin": page_admin, "legal": page_legal}.get(ss.page, page_home)()
+ "apply": page_apply, "coach_dash": page_coach_dash, "admin": page_admin, "legal": page_legal,
+ "gyms": page_gyms, "gym": page_gym, "gym_manage": page_gym_manage}.get(ss.page, page_home)()
 st.divider()
 fc = st.columns([1, 1, 4])
 fc[0].button("Privacy & Terms", on_click=nav, args=("legal",), key="legal")
