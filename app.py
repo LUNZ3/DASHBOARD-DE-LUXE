@@ -1,4 +1,5 @@
 """STRYKE - Find your coach. Train like a fighter.  (Streamlit app, single file: app.py + db.py)"""
+import hashlib
 import html
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -619,10 +620,38 @@ def _zoom_for(r):
     return 13 if r <= 3 else 12 if r <= 7 else 11 if r <= 15 else 10 if r <= 30 else 9
 
 
+@st.cache_resource(show_spinner=False, max_entries=6)
+def build_map(sig, lat, lon, radius, zoom, _gyms, _coaches):
+    """Same inputs -> the very same map object -> the browser keeps the map exactly as the visitor left it."""
+    import folium
+    from folium.plugins import MarkerCluster
+    m = folium.Map(location=[lat, lon], zoom_start=zoom, tiles=None, control_scale=True, scrollWheelZoom=True)
+    folium.TileLayer(tiles="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", name="Dark",
+                     attr="© OpenStreetMap contributors © CARTO", subdomains="abcd", max_zoom=19).add_to(m)
+    folium.TileLayer(tiles="OpenStreetMap", name="Street map").add_to(m)
+    folium.Circle([lat, lon], radius=radius * 1000, color=ACCENT, weight=1, fill=False, dash_array="6").add_to(m)
+    folium.CircleMarker([lat, lon], radius=5, color="#fff", fill=True, fill_color="#fff", tooltip="Search centre").add_to(m)
+    cluster = MarkerCluster(name="Gyms").add_to(m)
+    for g in _gyms:
+        col = ACCENT if g["pt_status"] == "yes" else "#6E6E78"
+        site = f'<br><a href="{e(g["website"])}" target="_blank" rel="noopener">Website</a>' if g["website"] else ""
+        pop = (f'<div style="font-family:sans-serif;min-width:190px;color:#111;overflow:auto">{logo_img(g, 44)}'
+               f'<b>{e(g["name"])}</b><br>{e(pt_label(g))}<br><small>{e(", ".join(g["sports"][:4]))}</small>{site}</div>')
+        folium.CircleMarker([g["lat"], g["lon"]], radius=10 if g["pt_status"] == "yes" else 7, color="#000", weight=1, fill=True,
+                            fill_color=col, fill_opacity=.95, tooltip=g["name"],
+                            popup=folium.Popup(pop, max_width=280)).add_to(cluster)
+    for c in _coaches:
+        pop = (f'<div style="font-family:sans-serif;color:#111"><b>{e(c["name"])}</b><br>Coach · '
+               f'{e(db.money(c["price_cents"], c["currency"]))} / {c["session_minutes"]} min<br><small>{e(", ".join(c["sports"]))}</small></div>')
+        folium.CircleMarker([c["lat"], c["lon"]], radius=8, color="#fff", weight=2, fill=True, fill_color="#FF2E63", fill_opacity=.95,
+                            tooltip=f"Coach: {c['name']}", popup=folium.Popup(pop, max_width=260)).add_to(m)
+    folium.LayerControl(collapsed=True).add_to(m)
+    return m
+
+
 def page_gyms():
     try:
-        import folium
-        from folium.plugins import MarkerCluster
+        import folium  # noqa: F401
         from streamlit_folium import st_folium
     except ImportError:
         st.error("Map components are missing. Make sure requirements.txt contains folium and streamlit-folium.")
@@ -700,9 +729,6 @@ def page_gyms():
                 db.fetch_osm(lat, lon, radius, force=True)
         except db.StrykeError as ex:
             st.warning(str(ex))
-    if rb[1].button("🎯 Search where the map is now") and ss.view_center:
-        recenter(ss.view_center[0], ss.view_center[1], "map view")
-        st.rerun()
 
     gyms = db.gyms_near(lat, lon, radius, sports, pt_only, qtxt)
     coaches = []
@@ -710,32 +736,13 @@ def page_gyms():
         coaches = [c for c in db.search_coaches(sports=[x for x in sports if x in db.SPORTS] or None)
                    if db.haversine_km(lat, lon, c["lat"], c["lon"]) <= radius]
 
-    # ---- map
-    m = folium.Map(location=[lat, lon], zoom_start=_zoom_for(radius), tiles=None, control_scale=True, scrollWheelZoom=True)
-    folium.TileLayer(tiles="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", name="Dark",
-                     attr="© OpenStreetMap contributors © CARTO", subdomains="abcd", max_zoom=19).add_to(m)
-    folium.TileLayer(tiles="OpenStreetMap", name="Street map").add_to(m)
-    folium.Circle([lat, lon], radius=radius * 1000, color=ACCENT, weight=1, fill=False, dash_array="6").add_to(m)
-    folium.CircleMarker([lat, lon], radius=5, color="#fff", fill=True, fill_color="#fff", tooltip="Search centre").add_to(m)
-    cluster = MarkerCluster(name="Gyms").add_to(m)
-    for g in gyms[:600]:
-        col = ACCENT if g["pt_status"] == "yes" else "#6E6E78"
-        site = f'<br><a href="{e(g["website"])}" target="_blank" rel="noopener">Website</a>' if g["website"] else ""
-        pop = (f'<div style="font-family:sans-serif;min-width:190px;color:#111;overflow:auto">{logo_img(g, 44)}'
-               f'<b>{e(g["name"])}</b><br>{e(pt_label(g))}<br><small>{e(", ".join(g["sports"][:4]))}</small>{site}</div>')
-        folium.CircleMarker([g["lat"], g["lon"]], radius=10 if g["pt_status"] == "yes" else 7, color="#000", weight=1, fill=True,
-                            fill_color=col, fill_opacity=.95, tooltip=g["name"],
-                            popup=folium.Popup(pop, max_width=280)).add_to(cluster)
-    for c in coaches:
-        pop = (f'<div style="font-family:sans-serif;color:#111"><b>{e(c["name"])}</b><br>Coach · '
-               f'{e(db.money(c["price_cents"], c["currency"]))} / {c["session_minutes"]} min<br><small>{e(", ".join(c["sports"]))}</small></div>')
-        folium.CircleMarker([c["lat"], c["lon"]], radius=8, color="#fff", weight=2, fill=True, fill_color="#FF2E63", fill_opacity=.95,
-                            tooltip=f"Coach: {c['name']}", popup=folium.Popup(pop, max_width=260)).add_to(m)
-    folium.LayerControl(collapsed=True).add_to(m)
+    # ---- map (built once per area/filters and cached, so reruns never re-render or reset it)
+    sig = hashlib.md5(repr((
+        [(g["id"], g["name"], g["pt_status"], g["pt_price_cents"], g["currency"], len(g["logo_b64"] or ""), g["website"]) for g in gyms[:600]],
+        [(c["id"], c["price_cents"]) for c in coaches])).encode()).hexdigest()
+    m = build_map(sig, round(lat, 5), round(lon, 5), radius, _zoom_for(radius), gyms[:600], coaches)
 
-    opts = dict(key="gymmap", height=560, returned_objects=["last_object_clicked", "center", "zoom"])
-    if ss.view_center and ss.view_zoom:  # keep the visitor's own pan/zoom across reruns
-        opts.update(center=ss.view_center, zoom=ss.view_zoom)
+    opts = dict(key="gymmap", height=560, returned_objects=["last_object_clicked"])
     try:
         ret = st_folium(m, use_container_width=True, **opts)
     except TypeError:
@@ -745,11 +752,6 @@ def page_gyms():
                 f'<span class="muted"> {len(gyms)} gyms · {len(coaches)} coaches within {radius} km</span>', unsafe_allow_html=True)
 
     if ret:
-        ctr = ret.get("center")
-        if ctr:
-            ss.view_center = (ctr["lat"], ctr["lng"])
-        if ret.get("zoom"):
-            ss.view_zoom = ret["zoom"]
         lc_ = ret.get("last_object_clicked")
         if lc_:
             best, bd = None, 0.08
