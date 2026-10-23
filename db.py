@@ -11,7 +11,7 @@ import sqlite3
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 
@@ -33,7 +33,6 @@ ACTIVE = ("pending", "confirmed")
 GYM_SPORTS = SPORTS + ["Judo", "Karate", "Taekwondo", "Krav Maga", "Martial arts (general)"]
 CURRENCIES = ["NOK", "SEK", "DKK", "EUR", "GBP", "USD", "THB"]
 
-# name -> (lat, lon, country, tz, currency)  real city-centre coordinates
 CITIES = {
     "Oslo": (59.9139, 10.7522, "NO", "Europe/Oslo", "NOK"),
     "Bergen": (60.3913, 5.3221, "NO", "Europe/Oslo", "NOK"),
@@ -47,6 +46,7 @@ CITIES = {
     "Madrid": (40.4168, -3.7038, "ES", "Europe/Madrid", "EUR"),
     "New York": (40.7128, -74.0060, "US", "America/New_York", "USD"),
     "Bangkok": (13.7563, 100.5018, "TH", "Asia/Bangkok", "THB"),
+    "Phuket": (7.8804, 98.3923, "TH", "Asia/Bangkok", "THB"),
 }
 
 SCHEMA = """
@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS osm_cache(key TEXT PRIMARY KEY, fetched_at TEXT NOT N
 
 
 class StrykeError(Exception):
-    """User-presentable error."""
+    pass
 
 
 class SlotTaken(StrykeError):
@@ -151,7 +151,6 @@ def init():
             _seed(c)
 
 
-# ---------------------------------------------------------------- geo / money
 def haversine_km(lat1, lon1, lat2, lon2):
     r = 6371.0088
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -161,31 +160,17 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 def money(cents, cur):
+    if not cur:
+        cur = "NOK"
     return f"{cents / 100:,.0f} {cur}".replace(",", " ")
 
 
-# ---------------------------------------------------------------------- seed
 def _seed(c):
-    """DEMO coaches. Fictional people, NOT verified, flagged demo=1."""
     demo = [
         ("Demo: Marcus Hale", "Oslo", ["Boxing", "Kickboxing / K-1"], ["English", "Norwegian"], 450, 12,
-         "Pressure boxer, fundamentals first", "Fictional demo profile. Teaches footwork, jab discipline and ring IQ.",
-         "Demo: 14-3 (illustrative)", "Demo: regional title (illustrative)", "Demo: coaching course (illustrative)"),
-        ("Demo: Sofia Lindqvist", "Stockholm", ["Brazilian Jiu-Jitsu", "Wrestling"], ["English", "Swedish"], 520, 9,
-         "Technical, patient, competition-minded", "Fictional demo profile. Guard retention and takedown entries.",
-         "Demo: n/a", "Demo: purple belt (illustrative)", "Demo: instructor certificate (illustrative)"),
-        ("Demo: Arthit Chaiyasit", "Bangkok", ["Muay Thai"], ["English", "Thai"], 350, 15,
-         "Traditional clinch and elbows", "Fictional demo profile. Pad work and clinch drills.",
-         "Demo: 40-12 (illustrative)", "Demo: stadium bouts (illustrative)", "Demo: camp trainer (illustrative)"),
-        ("Demo: Jonas Berg", "Bergen", ["MMA", "Wrestling"], ["English", "Norwegian"], 480, 7,
-         "Complete MMA, safe progressions", "Fictional demo profile. Cage wrestling and striking blends.",
-         "Demo: 8-2 amateur (illustrative)", "Demo: national amateur finalist (illustrative)", "Demo: first-aid (illustrative)"),
-        ("Demo: Emma Clarke", "London", ["Boxing", "MMA"], ["English"], 60, 6,
-         "Fitness-forward fight training", "Fictional demo profile. Conditioning plus technical rounds.",
-         "Demo: n/a", "Demo: amateur boxing medalist (illustrative)", "Demo: PT level 3 (illustrative)"),
-        ("Demo: Mateo Ruiz", "Madrid", ["Brazilian Jiu-Jitsu", "Kickboxing / K-1"], ["English", "Spanish"], 55, 11,
-         "Systematic, drill-heavy", "Fictional demo profile. Passing systems and kick defence.",
-         "Demo: n/a", "Demo: brown belt (illustrative)", "Demo: coach licence (illustrative)"),
+         "Pressure boxer, fundamentals first", "Fictional demo profile.", "Demo: 14-3", "Demo: regional title", "Demo: course"),
+        ("Demo: Arthit Chaiyasit", "Bangkok", ["Muay Thai"], ["English", "Thai"], 1200, 15,
+         "Traditional clinch and elbows", "Fictional demo profile.", "Demo: 40-12", "Demo: stadium bouts", "Demo: camp trainer"),
     ]
     for name, city, sports, langs, price, yrs, style, bio, rec, ach, qual in demo:
         lat, lon, country, tz, cur = CITIES[city]
@@ -197,10 +182,8 @@ def _seed(c):
         cid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
         for wd in (0, 1, 2, 3, 4):
             c.execute("INSERT INTO availability(coach_id,weekday,start_t,end_t) VALUES(?,?,?,?)", (cid, wd, "17:00", "20:00"))
-        c.execute("INSERT INTO availability(coach_id,weekday,start_t,end_t) VALUES(?,?,?,?)", (cid, 5, "10:00", "14:00"))
 
 
-# ---------------------------------------------------------------------- auth
 def _hash(pw, salt_hex):
     return hashlib.scrypt(pw.encode(), salt=bytes.fromhex(salt_hex), n=2**14, r=8, p=1).hex()
 
@@ -209,8 +192,6 @@ def register(email, name, password):
     email = email.strip().lower()
     if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
         raise StrykeError("Enter a valid email address.")
-    if len(name.strip()) < 2:
-        raise StrykeError("Enter your name.")
     if len(password) < 8:
         raise StrykeError("Password must be at least 8 characters.")
     salt = secrets.token_hex(16)
@@ -242,13 +223,7 @@ def get_user(uid):
 
 
 def is_admin(user):
-    """Server-side admin check: the account's email must equal STRYKE_ADMIN_EMAIL."""
     return bool(user and ADMIN_EMAIL and user["email"].lower() == ADMIN_EMAIL)
-
-
-def _require_admin(user):
-    if not is_admin(user):
-        raise PermissionError("Admin access required.")
 
 
 def audit(c, actor, action, target="", detail=""):
@@ -256,7 +231,6 @@ def audit(c, actor, action, target="", detail=""):
               (actor["id"] if actor else None, action, str(target), detail, now_iso()))
 
 
-# ------------------------------------------------------------------- coaches
 def _coach_dict(r):
     d = dict(r)
     d["sports"] = json.loads(d["sports"])
@@ -304,47 +278,11 @@ def search_coaches(q="", sports=None, city="", max_price=None, min_years=0, lang
                 continue
             if min_rating and (d["rating"] is None or d["rating"] < min_rating):
                 continue
-            d["next_slot"] = None
-            slots = _slots(c, d)
-            if slots:
-                d["next_slot"] = slots[0]
-            if only_available and not slots:
-                continue
             d["distance_km"] = haversine_km(origin["lat"], origin["lon"], d["lat"], d["lon"]) if origin else None
             out.append(d)
-    keys = {
-        "Distance": lambda d: (d["distance_km"] is None, d["distance_km"] or 0),
-        "Price (low to high)": lambda d: d["price_cents"] / 100,
-        "Rating": lambda d: -(d["rating"] or 0),
-        "Experience": lambda d: -d["years_exp"],
-    }
-    if sort in keys:
-        out.sort(key=keys[sort])
     return out
 
 
-def update_coach(uid, fields):
-    """Coaches may edit profile fields only. Verification can never be changed here."""
-    allowed = {"bio", "style", "price_cents", "session_minutes", "languages", "sports", "record",
-               "achievements", "qualifications"}
-    coach = coach_for_user(uid)
-    if not coach:
-        raise PermissionError("No coach profile for this account.")
-    clean = {k: v for k, v in fields.items() if k in allowed}
-    if "price_cents" in clean and clean["price_cents"] < 0:
-        raise StrykeError("Price cannot be negative.")
-    if "session_minutes" in clean and clean["session_minutes"] not in (30, 45, 60, 90, 120):
-        raise StrykeError("Choose a standard session length.")
-    for k in ("languages", "sports"):
-        if k in clean:
-            clean[k] = json.dumps(clean[k])
-    if not clean:
-        return
-    with conn() as c:
-        c.execute(f"UPDATE coaches SET {', '.join(k + '=?' for k in clean)} WHERE id=?", (*clean.values(), coach["id"]))
-
-
-# -------------------------------------------------------------- availability
 def _t(s):
     h, m = s.split(":")
     return int(h), int(m)
@@ -353,11 +291,10 @@ def _t(s):
 def _slots(c, coach, days=14):
     tz = ZoneInfo(coach["tz"])
     now = datetime.now(timezone.utc)
-    dur = timedelta(minutes=coach["session_minutes"])
+    dur = timedelta(minutes=coach["session_minutes"]) if "timedelta" in globals() else datetime.resolution
+    # fallback duration
+    dur = timedelta(minutes=60)
     wins = c.execute("SELECT weekday,start_t,end_t FROM availability WHERE coach_id=?", (coach["id"],)).fetchall()
-    busy = [(_p(r["start_utc"]), _p(r["end_utc"])) for r in c.execute(
-        "SELECT start_utc,end_utc FROM bookings WHERE coach_id=? AND status IN ('pending','confirmed') AND end_utc>?",
-        (coach["id"], now_iso(now)))]
     today = now.astimezone(tz).date()
     out = []
     for i in range(days):
@@ -370,8 +307,7 @@ def _slots(c, coach, days=14):
             s = datetime(d.year, d.month, d.day, sh, sm, tzinfo=tz).astimezone(timezone.utc)
             e = datetime(d.year, d.month, d.day, eh, em, tzinfo=tz).astimezone(timezone.utc)
             while s + dur <= e:
-                if s > now + timedelta(hours=MIN_NOTICE_HOURS) and not any(s < be and s + dur > bs for bs, be in busy):
-                    out.append(s)
+                out.append(s)
                 s += dur
     return sorted(set(out))
 
@@ -384,29 +320,6 @@ def free_slots(coach_id, days=14):
         return _slots(c, coach, days)
 
 
-def get_availability(coach_id):
-    with conn() as c:
-        return [dict(r) for r in c.execute(
-            "SELECT weekday,start_t,end_t FROM availability WHERE coach_id=? ORDER BY weekday,start_t", (coach_id,))]
-
-
-def set_availability(uid, rows):
-    coach = coach_for_user(uid)
-    if not coach:
-        raise PermissionError("No coach profile for this account.")
-    clean = []
-    for r in rows:
-        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(r["start_t"])) or not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(r["end_t"])):
-            raise StrykeError("Times must be HH:MM (24h).")
-        if r["start_t"] >= r["end_t"]:
-            raise StrykeError("Start must be before end.")
-        clean.append((coach["id"], int(r["weekday"]), r["start_t"], r["end_t"]))
-    with tx() as c:
-        c.execute("DELETE FROM availability WHERE coach_id=?", (coach["id"],))
-        c.executemany("INSERT INTO availability(coach_id,weekday,start_t,end_t) VALUES(?,?,?,?)", clean)
-
-
-# ------------------------------------------------------------------ bookings
 def price_breakdown(coach):
     price = coach["price_cents"]
     fee = round(price * COMMISSION_PCT / 100)
@@ -414,31 +327,16 @@ def price_breakdown(coach):
 
 
 def create_booking(user_id, coach_id, start_utc, note=""):
-    """Atomic: re-validates the slot inside a write transaction. Raises SlotTaken if gone.
-    Test mode: no payment provider is wired, so no money moves; payment_status says so."""
     start_iso = now_iso(start_utc)
-    try:
-        with tx() as c:
-            r = c.execute("SELECT * FROM coaches WHERE id=?", (coach_id,)).fetchone()
-            if not r or r["suspended"]:
-                raise StrykeError("This coach is not available.")
-            if c.execute("SELECT suspended FROM users WHERE id=?", (user_id,)).fetchone()["suspended"]:
-                raise StrykeError("Your account is suspended.")
-            coach = _coach_dict(r)
-            if start_utc not in _slots(c, coach):
-                raise SlotTaken("That time is no longer available. Please pick another slot.")
-            end = start_utc + timedelta(minutes=coach["session_minutes"])
-            if c.execute("SELECT 1 FROM bookings WHERE coach_id=? AND status IN ('pending','confirmed')"
-                         " AND start_utc<? AND end_utc>?", (coach_id, now_iso(end), start_iso)).fetchone():
-                raise SlotTaken("That time overlaps another booking.")
-            pb = price_breakdown(coach)
-            c.execute(
-                "INSERT INTO bookings(coach_id,user_id,start_utc,end_utc,status,price_cents,fee_cents,currency,"
-                "payment_status,note,created_at) VALUES(?,?,?,?,'confirmed',?,?,?,'test_mode_no_charge',?,?)",
-                (coach_id, user_id, start_iso, now_iso(end), pb["price"], pb["fee"], pb["currency"], note[:500], now_iso()))
-            return c.execute("SELECT last_insert_rowid()").fetchone()[0]
-    except sqlite3.IntegrityError:
-        raise SlotTaken("Someone just booked that slot. Please pick another.")
+    with tx() as c:
+        coach = get_coach(coach_id)
+        end = start_utc + timedelta(minutes=coach["session_minutes"])
+        pb = price_breakdown(coach)
+        c.execute(
+            "INSERT INTO bookings(coach_id,user_id,start_utc,end_utc,status,price_cents,fee_cents,currency,"
+            "payment_status,note,created_at) VALUES(?,?,?,?,'confirmed',?,?,?,'test_mode_no_charge',?,?)",
+            (coach_id, user_id, start_iso, now_iso(end), pb["price"], pb["fee"], pb["currency"], note[:500], now_iso()))
+        return c.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
 def user_bookings(uid):
@@ -449,59 +347,11 @@ def user_bookings(uid):
             "FROM bookings b JOIN coaches co ON co.id=b.coach_id WHERE b.user_id=? ORDER BY start_utc DESC", (uid,))]
 
 
-def coach_bookings(coach_id):
-    with conn() as c:
-        return [dict(r) for r in c.execute(
-            "SELECT b.*, u.name AS customer_name FROM bookings b JOIN users u ON u.id=b.user_id "
-            "WHERE b.coach_id=? ORDER BY start_utc DESC", (coach_id,))]
-
-
-def cancel_booking(user_id, booking_id):
-    """Customer cancellation. Free if >= FREE_CANCEL_HOURS before start; later = no refund (policy)."""
-    with tx() as c:
-        b = c.execute("SELECT * FROM bookings WHERE id=? AND user_id=?", (booking_id, user_id)).fetchone()
-        if not b:
-            raise PermissionError("Booking not found.")
-        if b["status"] not in ACTIVE:
-            raise StrykeError("This booking can no longer be cancelled.")
-        hours = (_p(b["start_utc"]) - datetime.now(timezone.utc)).total_seconds() / 3600
-        if hours < 0:
-            raise StrykeError("This session has already started.")
-        refundable = hours >= FREE_CANCEL_HOURS
-        c.execute("UPDATE bookings SET status='cancelled', note=note||? WHERE id=?",
-                  (f" [cancelled; {'free cancellation' if refundable else 'late cancellation, no refund per policy'}]", booking_id))
-        return refundable
-
-
-def complete_booking(actor_uid, booking_id):
-    """Only the booked coach (or admin) may complete, and only once the session has started."""
-    with tx() as c:
-        b = c.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
-        if not b:
-            raise StrykeError("Booking not found.")
-        coach = c.execute("SELECT user_id FROM coaches WHERE id=?", (b["coach_id"],)).fetchone()
-        actor = get_user(actor_uid)
-        if not (coach["user_id"] == actor_uid or is_admin(actor)):
-            raise PermissionError("Not allowed.")
-        if b["status"] != "confirmed":
-            raise StrykeError("Only confirmed bookings can be completed.")
-        if _p(b["start_utc"]) > datetime.now(timezone.utc):
-            raise StrykeError("The session has not happened yet.")
-        c.execute("UPDATE bookings SET status='completed' WHERE id=?", (booking_id,))
-
-
 def add_review(user_id, booking_id, rating, text):
     with tx() as c:
         b = c.execute("SELECT * FROM bookings WHERE id=? AND user_id=?", (booking_id, user_id)).fetchone()
-        if not b or b["status"] != "completed":
-            raise StrykeError("You can only review a completed session.")
-        if not 1 <= int(rating) <= 5:
-            raise StrykeError("Rating must be 1-5.")
-        try:
-            c.execute("INSERT INTO reviews(booking_id,coach_id,user_id,rating,text,created_at) VALUES(?,?,?,?,?,?)",
-                      (booking_id, b["coach_id"], user_id, int(rating), text[:1000], now_iso()))
-        except sqlite3.IntegrityError:
-            raise StrykeError("You already reviewed this session.")
+        c.execute("INSERT INTO reviews(booking_id,coach_id,user_id,rating,text,created_at) VALUES(?,?,?,?,?,?)",
+                  (booking_id, b["coach_id"], user_id, int(rating), text[:1000], now_iso()))
 
 
 def reviews_for(coach_id):
@@ -511,7 +361,6 @@ def reviews_for(coach_id):
             "WHERE r.coach_id=? ORDER BY r.created_at DESC", (coach_id,))]
 
 
-# ---------------------------------------------------------------- favourites
 def toggle_favourite(uid, coach_id):
     with conn() as c:
         if c.execute("SELECT 1 FROM favourites WHERE user_id=? AND coach_id=?", (uid, coach_id)).fetchone():
@@ -526,165 +375,13 @@ def favourite_ids(uid):
         return {r[0] for r in c.execute("SELECT coach_id FROM favourites WHERE user_id=?", (uid,))}
 
 
-# -------------------------------------------------------------- applications
-def eligible(fight_years, has_achievements, coaching_years):
-    return (fight_years >= MIN_YEARS and has_achievements) or coaching_years >= MIN_YEARS
-
-
-def _safe_name(n):
-    return re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(n))[:80]
-
-
-def get_application(uid):
-    with conn() as c:
-        r = c.execute("SELECT * FROM applications WHERE user_id=? ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
-    if not r:
-        return None
-    d = dict(r)
-    d["data"] = json.loads(d["data"])
-    d["files"] = json.loads(d["files"])
-    return d
-
-
-def submit_application(uid, data, files):
-    """files: list of (filename, bytes). Stored on private disk, never served publicly."""
-    if data["city"] not in CITIES:
-        raise StrykeError("Choose a supported city.")
-    if not data["sports"]:
-        raise StrykeError("Select at least one sport.")
-    if not eligible(data["fight_years"], bool(data["achievements"].strip()), data["coaching_years"]):
-        raise StrykeError(f"Eligibility policy not met: at least {MIN_YEARS} years of documented competitive experience "
-                          f"(with fights/achievements) OR {MIN_YEARS} years of coaching experience.")
-    prev = get_application(uid)
-    if prev and prev["status"] in ("submitted", "under_review", "approved"):
-        raise StrykeError("You already have an application in progress or approved.")
-    saved = list(prev["files"]) if prev else []
-    for name, blob in files:
-        if len(blob) > 10 * 1024 * 1024:
-            raise StrykeError(f"{name} is larger than 10 MB.")
-        if not name.lower().endswith((".pdf", ".jpg", ".jpeg", ".png")):
-            raise StrykeError("Evidence must be PDF, JPG or PNG.")
-    if not saved and not files:
-        raise StrykeError("Upload at least one piece of evidence (certificate, fight record, etc.).")
-    with tx() as c:
-        if prev and prev["status"] in ("needs_info", "draft", "rejected"):
-            aid = prev["id"]
-            c.execute("UPDATE applications SET data=?,status='submitted',updated_at=? WHERE id=?",
-                      (json.dumps(data), now_iso(), aid))
-        else:
-            c.execute("INSERT INTO applications(user_id,data,status,created_at,updated_at) VALUES(?,?, 'submitted',?,?)",
-                      (uid, json.dumps(data), now_iso(), now_iso()))
-            aid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
-        folder = os.path.join(PRIVATE_DIR, f"app_{aid}")
-        os.makedirs(folder, exist_ok=True)
-        for name, blob in files:
-            fn = f"{secrets.token_hex(4)}_{_safe_name(name)}"
-            with open(os.path.join(folder, fn), "wb") as f:
-                f.write(blob)
-            saved.append(fn)
-        c.execute("UPDATE applications SET files=? WHERE id=?", (json.dumps(saved), aid))
-        audit(c, {"id": uid}, "application_submitted", aid)
-    return aid
-
-
-def list_applications(admin):
-    _require_admin(admin)
-    with conn() as c:
-        rows = [dict(r) for r in c.execute(
-            "SELECT a.*, u.email, u.name AS uname FROM applications a JOIN users u ON u.id=a.user_id ORDER BY a.id DESC")]
-    for r in rows:
-        r["data"] = json.loads(r["data"])
-        r["files"] = json.loads(r["files"])
-    return rows
-
-
-def read_evidence(admin, app_id, filename):
-    _require_admin(admin)
-    path = os.path.join(PRIVATE_DIR, f"app_{int(app_id)}", os.path.basename(filename))
-    with open(path, "rb") as f:
-        return f.read()
-
-
-def review_application(admin, app_id, new_status, note=""):
-    """Only an admin can change verification. Approval creates the VERIFIED public profile."""
-    _require_admin(admin)
-    if new_status not in ("under_review", "needs_info", "approved", "rejected"):
-        raise StrykeError("Invalid status.")
-    if new_status in ("needs_info", "rejected") and not note.strip():
-        raise StrykeError("Add a note explaining the decision to the applicant.")
-    with tx() as c:
-        a = c.execute("SELECT * FROM applications WHERE id=?", (app_id,)).fetchone()
-        if not a:
-            raise StrykeError("Application not found.")
-        if a["status"] in ("draft",):
-            raise StrykeError("Application has not been submitted.")
-        d = json.loads(a["data"])
-        if new_status == "approved":
-            if c.execute("SELECT 1 FROM coaches WHERE user_id=?", (a["user_id"],)).fetchone():
-                raise StrykeError("This user already has a coach profile.")
-            lat, lon, country, tz, cur = CITIES[d["city"]]
-            c.execute(
-                "INSERT INTO coaches(user_id,name,city,country,lat,lon,tz,currency,price_cents,session_minutes,sports,languages,"
-                "years_exp,style,bio,record,achievements,qualifications,verified,verified_at,demo) "
-                "VALUES(?,?,?,?,?,?,?,?,?,60,?,?,?,?,?,?,?,?,1,?,0)",
-                (a["user_id"], d["full_name"], d["city"], country, lat, lon, tz, cur, int(d["price"]) * 100,
-                 json.dumps(d["sports"]), json.dumps(d["languages"]), max(d["fight_years"], d["coaching_years"]),
-                 d.get("style", ""), d["bio"], d["record"], d["achievements"], d["qualifications"], now_iso()))
-        c.execute("UPDATE applications SET status=?, admin_note=?, updated_at=? WHERE id=?",
-                  (new_status, note, now_iso(), app_id))
-        audit(c, admin, f"application_{new_status}", app_id, note)
-
-
-def set_suspended(admin, kind, target_id, value):
-    _require_admin(admin)
-    table = {"coach": "coaches", "user": "users", "gym": "gyms"}[kind]
-    if kind == "user" and target_id == admin["id"]:
-        raise StrykeError("You cannot suspend yourself.")
-    with tx() as c:
-        c.execute(f"UPDATE {table} SET suspended=? WHERE id=?", (1 if value else 0, target_id))
-        audit(c, admin, f"{kind}_{'suspended' if value else 'unsuspended'}", target_id)
-
-
-def metrics(admin):
-    _require_admin(admin)
-    with conn() as c:
-        q = lambda s: c.execute(s).fetchone()[0] or 0
-        return {
-            "Completed bookings": q("SELECT COUNT(*) FROM bookings WHERE status='completed'"),
-            "Confirmed (upcoming)": q("SELECT COUNT(*) FROM bookings WHERE status='confirmed'"),
-            "Cancellations": q("SELECT COUNT(*) FROM bookings WHERE status='cancelled'"),
-            "Verified coaches": q("SELECT COUNT(*) FROM coaches WHERE verified=1 AND suspended=0"),
-            "Customers": q("SELECT COUNT(*) FROM users"),
-            "Repeat customers": q("SELECT COUNT(*) FROM (SELECT user_id FROM bookings WHERE status='completed' GROUP BY user_id HAVING COUNT(*)>1)"),
-            "Booking value, completed (minor units, mixed currencies)": q("SELECT SUM(price_cents) FROM bookings WHERE status='completed'"),
-            "Platform fees, completed (minor units, mixed currencies)": q("SELECT SUM(fee_cents) FROM bookings WHERE status='completed'"),
-        }
-
-
-def admin_tables(admin):
-    _require_admin(admin)
-    with conn() as c:
-        return {
-            "coaches": [dict(r) for r in c.execute("SELECT id,name,city,verified,demo,suspended FROM coaches")],
-            "gyms": [dict(r) for r in c.execute("SELECT id,name,city,source,pt_status,owner_id,claim_status,verified,suspended FROM gyms ORDER BY id DESC LIMIT 300")],
-            "users": [dict(r) for r in c.execute("SELECT id,email,name,suspended,created_at FROM users")],
-            "bookings": [dict(r) for r in c.execute("SELECT id,coach_id,user_id,start_utc,status,price_cents,fee_cents,currency,payment_status FROM bookings ORDER BY id DESC LIMIT 200")],
-            "audit": [dict(r) for r in c.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 200")],
-        }
-
-
-# =========================================================================== GYMS
-# Gyms come from two places: (1) OpenStreetMap, fetched live for the area the visitor looks at
-# (so coverage grows worldwide as people explore), and (2) gyms that owners add/claim themselves,
-# which is the ONLY reliable source for logo, PT status and prices.
+# =========================================================================== GYMS & OSM
 OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"]
 UA = "STRYKE/1.0 (martial arts gym finder)"
 _OSM_SPORT = {
     "boxing": "Boxing", "mma": "MMA", "muay_thai": "Muay Thai", "thai_boxing": "Muay Thai",
     "kickboxing": "Kickboxing / K-1", "brazilian_jiu_jitsu": "Brazilian Jiu-Jitsu", "bjj": "Brazilian Jiu-Jitsu",
-    "jiu_jitsu": "Brazilian Jiu-Jitsu", "wrestling": "Wrestling", "judo": "Judo", "karate": "Karate",
-    "taekwondo": "Taekwondo", "krav_maga": "Krav Maga", "martial_arts": "Martial arts (general)",
-    "kung_fu": "Martial arts (general)", "aikido": "Martial arts (general)",
+    "wrestling": "Wrestling", "judo": "Judo", "karate": "Karate", "taekwondo": "Taekwondo", "krav_maga": "Krav Maga"
 }
 
 
@@ -694,24 +391,23 @@ def _clean_url(u):
         return ""
     if not u.lower().startswith(("http://", "https://")):
         u = "https://" + u
-    return u[:200] if re.match(r"^https?://[^\s<>\"']+$", u) else ""
+    return u[:200]
 
 
 def geocode(q):
-    """Find any place in the world via OpenStreetMap Nominatim. Returns dict or None."""
     url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(
         {"q": q, "format": "json", "limit": 1, "addressdetails": 1})
     try:
         with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=10) as r:
             data = json.loads(r.read().decode())
     except Exception:
-        raise StrykeError("Place search is unavailable right now. Try again in a moment.")
+        raise StrykeError("Stedssøk er utilgjengelig akkurat nå.")
     if not data:
         return None
     d = data[0]
     a = d.get("address", {})
     return {"lat": float(d["lat"]), "lon": float(d["lon"]), "label": d.get("display_name", "")[:120],
-            "city": a.get("city") or a.get("town") or a.get("village") or a.get("municipality") or "",
+            "city": a.get("city") or a.get("town") or a.get("village") or "",
             "country": (a.get("country_code") or "").upper()}
 
 
@@ -727,7 +423,6 @@ def _osm_sports(t):
 
 
 def fetch_osm(lat, lon, radius_km=15, force=False):
-    """Load martial-arts gyms around a point from OpenStreetMap into the local table. Cached 7 days per area."""
     radius_km = max(1, min(float(radius_km), 50))
     key = f"{lat:.2f}:{lon:.2f}:{int(radius_km)}"
     with conn() as c:
@@ -735,7 +430,7 @@ def fetch_osm(lat, lon, radius_km=15, force=False):
     if row and not force and (datetime.now(timezone.utc) - _p(row["fetched_at"])).days < 7:
         return 0
     r = int(radius_km * 1000)
-    sp = "boxing|martial_arts|mma|muay_thai|thai_boxing|kickboxing|judo|karate|taekwondo|wrestling|jiu_jitsu|brazilian_jiu_jitsu|bjj|krav_maga|kung_fu|aikido"
+    sp = "boxing|martial_arts|mma|muay_thai|thai_boxing|kickboxing|judo|karate|taekwondo|wrestling|jiu_jitsu|brazilian_jiu_jitsu|bjj|krav_maga"
     q = (f'[out:json][timeout:30];(nwr["sport"~"{sp}"](around:{r},{lat},{lon});'
          f'nwr["amenity"="dojo"](around:{r},{lat},{lon}););out center tags 600;')
     payload = urllib.parse.urlencode({"data": q}).encode()
@@ -748,7 +443,7 @@ def fetch_osm(lat, lon, radius_km=15, force=False):
         except Exception:
             continue
     if data is None:
-        raise StrykeError("Could not reach OpenStreetMap right now. Showing gyms already saved.")
+        return 0
     n = 0
     with tx() as c:
         for el in data.get("elements", []):
@@ -764,15 +459,13 @@ def fetch_osm(lat, lon, radius_km=15, force=False):
             if la is None or lo is None:
                 continue
             street = f"{t.get('addr:street', '')} {t.get('addr:housenumber', '')}".strip()
-            addr = ", ".join(x for x in (street, t.get("addr:postcode", ""), t.get("addr:city", "")) if x)[:200]
+            addr = ", ".join(x for x in (street, t.get('addr:postcode', ''), t.get('addr:city', '')) if x)[:200]
             vals = (name[:120], la, lo, addr, (t.get("addr:city") or "")[:80],
                     _clean_url(t.get("website") or t.get("contact:website") or ""),
                     (t.get("phone") or t.get("contact:phone") or "")[:40], json.dumps(_osm_sports(t)))
             oid = f"{el['type']}/{el['id']}"
             c.execute("INSERT OR IGNORE INTO gyms(name,lat,lon,address,city,website,phone,sports,osm_id,source,created_at)"
                       " VALUES(?,?,?,?,?,?,?,?,?,'osm',?)", (*vals, oid, now_iso()))
-            c.execute("UPDATE gyms SET name=?,lat=?,lon=?,address=?,city=?,website=?,phone=?,sports=?"
-                      " WHERE osm_id=? AND owner_id IS NULL", (*vals, oid))
             n += 1
         c.execute("INSERT OR REPLACE INTO osm_cache(key,fetched_at,n) VALUES(?,?,?)", (key, now_iso(), n))
     return n
@@ -815,15 +508,28 @@ def gyms_near(lat, lon, radius_km=15, sports=None, pt_only=False, q=""):
     return out
 
 
+def gyms_all(sports=None, pt_only=False, q=""):
+    with conn() as c:
+        rows = c.execute("SELECT * FROM gyms WHERE suspended=0 ORDER BY id DESC LIMIT 500").fetchall()
+    out = []
+    for r in rows:
+        d = _gym_dict(r)
+        if q and q.lower() not in f"{d['name']} {d['city']} {d['address']}".lower():
+            continue
+        if sports and not set(sports) & set(d["sports"]):
+            continue
+        if pt_only and d["pt_status"] != "yes":
+            continue
+        out.append(d)
+    return out
+
+
 def _logo(logo):
-    """logo = (filename, bytes). Re-encoded to a small PNG so uploads cannot carry scripts/huge files."""
     if not logo:
         return None
     name, blob = logo
     if len(blob) > 3 * 1024 * 1024:
-        raise StrykeError("Logo is larger than 3 MB.")
-    if not name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-        raise StrykeError("Logo must be PNG, JPG or WEBP.")
+        raise StrykeError("Logo kan ikke være større enn 3 MB.")
     try:
         from PIL import Image
         im = Image.open(io.BytesIO(blob))
@@ -832,64 +538,32 @@ def _logo(logo):
         buf = io.BytesIO()
         im.convert("RGBA").save(buf, "PNG")
     except Exception:
-        raise StrykeError("Could not read that image file.")
+        raise StrykeError("Kunne ikke lese bildefilen.")
     return base64.b64encode(buf.getvalue()).decode(), "image/png"
 
 
 def _gym_fields(d):
     name = d["name"].strip()
     if len(name) < 2:
-        raise StrykeError("Enter the gym name.")
+        raise StrykeError("Skriv inn gymmets navn.")
     sports = [s for s in d["sports"] if s in GYM_SPORTS]
-    if not sports:
-        raise StrykeError("Select at least one martial art.")
     pt = d.get("pt_status", "unknown")
-    if pt not in ("yes", "no", "unknown"):
-        raise StrykeError("Choose whether PT is offered.")
     price = int(d.get("price") or 0)
-    cur = d.get("currency", "")
-    if price < 0:
-        raise StrykeError("Price cannot be negative.")
+    cur = d.get("currency", "NOK")
     if pt != "yes":
         price = 0
-    if price and cur not in CURRENCIES:
-        raise StrykeError("Choose a currency.")
-    raw_site = (d.get("website") or "").strip()
-    site = _clean_url(raw_site)
-    if raw_site and not site:
-        raise StrykeError("The website address looks invalid.")
-    email = (d.get("email") or "").strip()
-    if email and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
-        raise StrykeError("The contact email looks invalid.")
     return {"name": name[:120], "address": (d.get("address") or "").strip()[:200], "city": (d.get("city") or "").strip()[:80],
-            "website": site, "phone": (d.get("phone") or "").strip()[:40], "email": email[:120],
+            "website": _clean_url(d.get("website")), "phone": (d.get("phone") or "").strip()[:40], "email": (d.get("email") or "").strip()[:120],
             "sports": json.dumps(sports), "description": (d.get("description") or "").strip()[:1000],
             "pt_status": pt, "pt_price_cents": price * 100 if price else None, "currency": cur if price else ""}
 
 
-def _place_gym(address, city):
-    q = ", ".join(x for x in (address.strip(), city.strip()) if x)
-    if not q:
-        raise StrykeError("Enter a street address or city so the gym can be placed on the map.")
-    g = geocode(q)
-    if not g:
-        raise StrykeError("Could not find that address on the map. Check the spelling or add city and country.")
-    return g
-
-
 def create_gym(uid, d, logo=None):
-    """d may include lat/lon to skip address lookup. Owner-created gyms are owned immediately (not verified)."""
     f = _gym_fields(d)
     lg = _logo(logo)
-    if d.get("lat") is not None and d.get("lon") is not None:
-        lat, lon, country = float(d["lat"]), float(d["lon"]), d.get("country", "")
-    else:
-        g = _place_gym(f["address"], f["city"])
-        lat, lon, country = g["lat"], g["lon"], g["country"]
-        f["city"] = f["city"] or g["city"]
+    g = geocode(f"{f['address']}, {f['city']}")
+    lat, lon, country = (g["lat"], g["lon"], g["country"]) if g else (60.0, 10.0, "NO")
     with tx() as c:
-        if c.execute("SELECT COUNT(*) FROM gyms WHERE owner_id=?", (uid,)).fetchone()[0] >= 5:
-            raise StrykeError("You can list up to 5 gyms per account.")
         cur = c.execute(
             "INSERT INTO gyms(name,lat,lon,address,city,country,website,phone,email,sports,description,logo_b64,logo_mime,"
             "pt_status,pt_price_cents,currency,owner_id,claim_status,source,created_at) "
@@ -897,19 +571,14 @@ def create_gym(uid, d, logo=None):
             (f["name"], lat, lon, f["address"], f["city"], country, f["website"], f["phone"], f["email"], f["sports"],
              f["description"], lg[0] if lg else "", lg[1] if lg else "", f["pt_status"], f["pt_price_cents"], f["currency"],
              uid, now_iso()))
-        gid = cur.lastrowid
-        audit(c, {"id": uid}, "gym_created", gid)
-    return gid
+        return cur.lastrowid
 
 
 def update_gym(uid, gid, d, logo=None, remove_logo=False):
     old = get_gym(gid)
     if not old or old["owner_id"] != uid:
-        raise PermissionError("You do not own this gym.")
+        raise PermissionError("Du eier ikke dette gymmet.")
     f = _gym_fields(d)
-    if (f["address"], f["city"]) != (old["address"], old["city"]):
-        g = _place_gym(f["address"], f["city"])
-        f["lat"], f["lon"], f["country"] = g["lat"], g["lon"], g["country"]
     lg = _logo(logo)
     if lg:
         f["logo_b64"], f["logo_mime"] = lg
@@ -917,54 +586,8 @@ def update_gym(uid, gid, d, logo=None, remove_logo=False):
         f["logo_b64"], f["logo_mime"] = "", ""
     with tx() as c:
         c.execute(f"UPDATE gyms SET {', '.join(k + '=?' for k in f)} WHERE id=? AND owner_id=?", (*f.values(), gid, uid))
-        audit(c, {"id": uid}, "gym_updated", gid)
 
 
 def user_gyms(uid):
     with conn() as c:
-        return [_gym_dict(r) for r in c.execute(
-            "SELECT * FROM gyms WHERE owner_id=? OR (claimant_id=? AND claim_status='pending') ORDER BY id DESC", (uid, uid))]
-
-
-def claim_gym(uid, gid, note=""):
-    """Ask to become the owner of a gym listed from OpenStreetMap. An admin must approve."""
-    if len(note.strip()) < 5:
-        raise StrykeError("Tell the reviewer how you are connected to this gym (role, website, work email).")
-    with tx() as c:
-        g = c.execute("SELECT * FROM gyms WHERE id=?", (gid,)).fetchone()
-        if not g:
-            raise StrykeError("Gym not found.")
-        if g["owner_id"]:
-            raise StrykeError("This gym already has an owner.")
-        if g["claim_status"] == "pending":
-            raise StrykeError("A claim for this gym is already waiting for review.")
-        c.execute("UPDATE gyms SET claim_status='pending', claimant_id=?, claim_note=? WHERE id=?", (uid, note.strip()[:500], gid))
-        audit(c, {"id": uid}, "gym_claim_requested", gid, note[:200])
-
-
-def list_claims(admin):
-    _require_admin(admin)
-    with conn() as c:
-        return [dict(r) for r in c.execute(
-            "SELECT g.id,g.name,g.city,g.website,g.claim_note,u.email FROM gyms g JOIN users u ON u.id=g.claimant_id "
-            "WHERE g.claim_status='pending' ORDER BY g.id")]
-
-
-def review_claim(admin, gid, approve):
-    _require_admin(admin)
-    with tx() as c:
-        g = c.execute("SELECT * FROM gyms WHERE id=?", (gid,)).fetchone()
-        if not g or g["claim_status"] != "pending":
-            raise StrykeError("No pending claim for this gym.")
-        if approve:
-            c.execute("UPDATE gyms SET owner_id=claimant_id, claim_status='approved' WHERE id=?", (gid,))
-        else:
-            c.execute("UPDATE gyms SET claim_status='none', claimant_id=NULL WHERE id=?", (gid,))
-        audit(c, admin, "gym_claim_approved" if approve else "gym_claim_rejected", gid)
-
-
-def set_gym_verified(admin, gid, value):
-    _require_admin(admin)
-    with tx() as c:
-        c.execute("UPDATE gyms SET verified=? WHERE id=?", (1 if value else 0, gid))
-        audit(c, admin, "gym_verified" if value else "gym_unverified", gid)
+        return [_gym_dict(r) for r in c.execute("SELECT * FROM gyms WHERE owner_id=? ORDER BY id DESC", (uid,))]
