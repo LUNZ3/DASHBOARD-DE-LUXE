@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import streamlit as st
 
-import db.py
+import db
 import theme
 
 st.set_page_config(page_title="STRYKE", page_icon="🥊", layout="wide")
