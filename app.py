@@ -1,5 +1,4 @@
 """STRYKE - Find your coach. Train like a fighter.  (Streamlit app, single file: app.py + db.py)"""
-import hashlib
 import html
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -115,7 +114,7 @@ def header():
     cols = st.columns([1.8, 1, 1, 1.1, 1, 1.4])
     cols[0].markdown('<div class="brand">STRY<b>K</b>E</div>', unsafe_allow_html=True)
     cols[1].button("Find a coach", on_click=nav, args=("coaches",), use_container_width=True)
-    cols[2].button("Gym map", on_click=nav, args=("gyms",), use_container_width=True, key="hg")
+    cols[2].button("🗺️ Gym map", on_click=nav, args=("gyms",), use_container_width=True, key="hg")
     cols[3].button("Become a coach", on_click=nav, args=("apply",), use_container_width=True)
     if user:
         cols[4].button("My bookings", on_click=nav, args=("dashboard",), use_container_width=True)
@@ -158,8 +157,8 @@ def page_home():
         '<p>Book experienced boxing, MMA, Muay Thai, kickboxing, BJJ and wrestling coaches near you. '
         'Compare real credentials, pick a time, train.</p></div>', unsafe_allow_html=True)
     a, b, b2, _ = st.columns([1, 1, 1, 2])
-    a.button("Find a coach", type="primary", on_click=nav, args=("coaches",), use_container_width=True, key="h1")
-    b.button("Open gym map", on_click=nav, args=("gyms",), use_container_width=True, key="h3")
+    a.button("Find a coach", on_click=nav, args=("coaches",), use_container_width=True, key="h1")
+    b.button("🗺️ OPEN MAP", type="primary", on_click=nav, args=("gyms",), use_container_width=True, key="h3")
     b2.button("Become a coach", on_click=nav, args=("apply",), use_container_width=True, key="h2")
 
     st.markdown("### Sports")
@@ -620,148 +619,147 @@ def _zoom_for(r):
     return 13 if r <= 3 else 12 if r <= 7 else 11 if r <= 15 else 10 if r <= 30 else 9
 
 
-@st.cache_resource(show_spinner=False, max_entries=6)
-def build_map(sig, lat, lon, radius, zoom, _gyms, _coaches):
-    """Same inputs -> the very same map object -> the browser keeps the map exactly as the visitor left it."""
-    import folium
-    from folium.plugins import MarkerCluster
-    m = folium.Map(location=[lat, lon], zoom_start=zoom, tiles=None, control_scale=True, scrollWheelZoom=True)
-    folium.TileLayer(tiles="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", name="Dark",
-                     attr="© OpenStreetMap contributors © CARTO", subdomains="abcd", max_zoom=19).add_to(m)
-    folium.TileLayer(tiles="OpenStreetMap", name="Street map").add_to(m)
-    folium.Circle([lat, lon], radius=radius * 1000, color=ACCENT, weight=1, fill=False, dash_array="6").add_to(m)
-    folium.CircleMarker([lat, lon], radius=5, color="#fff", fill=True, fill_color="#fff", tooltip="Search centre").add_to(m)
-    cluster = MarkerCluster(name="Gyms").add_to(m)
-    for g in _gyms:
-        col = ACCENT if g["pt_status"] == "yes" else "#6E6E78"
-        site = f'<br><a href="{e(g["website"])}" target="_blank" rel="noopener">Website</a>' if g["website"] else ""
-        pop = (f'<div style="font-family:sans-serif;min-width:190px;color:#111;overflow:auto">{logo_img(g, 44)}'
-               f'<b>{e(g["name"])}</b><br>{e(pt_label(g))}<br><small>{e(", ".join(g["sports"][:4]))}</small>{site}</div>')
-        folium.CircleMarker([g["lat"], g["lon"]], radius=10 if g["pt_status"] == "yes" else 7, color="#000", weight=1, fill=True,
-                            fill_color=col, fill_opacity=.95, tooltip=g["name"],
-                            popup=folium.Popup(pop, max_width=280)).add_to(cluster)
-    for c in _coaches:
-        pop = (f'<div style="font-family:sans-serif;color:#111"><b>{e(c["name"])}</b><br>Coach · '
-               f'{e(db.money(c["price_cents"], c["currency"]))} / {c["session_minutes"]} min<br><small>{e(", ".join(c["sports"]))}</small></div>')
-        folium.CircleMarker([c["lat"], c["lon"]], radius=8, color="#fff", weight=2, fill=True, fill_color="#FF2E63", fill_opacity=.95,
-                            tooltip=f"Coach: {c['name']}", popup=folium.Popup(pop, max_width=260)).add_to(m)
-    folium.LayerControl(collapsed=True).add_to(m)
-    return m
+def _rgb(hexcol):
+    return [int(hexcol[i:i + 2], 16) for i in (1, 3, 5)]
 
 
 def page_gyms():
-    try:
-        import folium  # noqa: F401
-        from streamlit_folium import st_folium
-    except ImportError:
-        st.error("Map components are missing. Make sure requirements.txt contains folium and streamlit-folium.")
-        return
+    import pandas as pd
+    import pydeck as pdk
 
-    st.markdown("## Gym map")
-    st.caption("Drag to move, scroll or pinch to zoom, click a dot for details. Gyms are loaded from OpenStreetMap for the area you look "
-               "at, so search any place in the world. Logo, PT and price only appear when the gym itself has added them.")
+    st.markdown("## 🗺️ Gym map")
+    st.caption("Drag to move, scroll or pinch to zoom, click a dot for details. Gyms come from OpenStreetMap; logo, PT and price "
+               "appear when the gym itself has added them.")
+    world = st.radio("View", ["📍 Near a place", "🌍 Whole world"], horizontal=True, label_visibility="collapsed",
+                     key="map_mode").startswith("🌍")
 
     def recenter(la, lo, label):
         ss.map_center, ss.map_label, ss.last_fetch = (la, lo), label, None
-        ss.view_center, ss.view_zoom = None, None
 
-    # ---- where to look
-    with st.form("placeform", border=False):
-        pc = st.columns([3, 1])
-        place = pc[0].text_input("Search any place in the world", placeholder="Bangkok · Rio de Janeiro · Karl Johans gate, Oslo",
-                                 label_visibility="collapsed")
-        go = pc[1].form_submit_button("🔍 Search", type="primary", use_container_width=True)
-    lc = st.columns([1.3, 1.5, 2])
-    if lc[0].button("📍 Use my location (GPS)"):
-        ss.gps_map = True
-    if ss.gps_map:
-        try:
-            from streamlit_js_eval import get_geolocation
-            g = get_geolocation()
-            if g and "coords" in g:
-                recenter(g["coords"]["latitude"], g["coords"]["longitude"], "your GPS position")
+    lat, lon = ss.map_center
+    if not world:
+        with st.form("placeform", border=False):
+            pc = st.columns([3, 1])
+            place = pc[0].text_input("Search any place in the world", placeholder="Bangkok · Rio de Janeiro · Karl Johans gate, Oslo",
+                                     label_visibility="collapsed")
+            go = pc[1].form_submit_button("🔍 Search", type="primary", use_container_width=True)
+        lc = st.columns([1.3, 1.5, 2])
+        if lc[0].button("📍 Use my location (GPS)"):
+            ss.gps_map = True
+        if ss.gps_map:
+            try:
+                from streamlit_js_eval import get_geolocation
+                g = get_geolocation()
+                if g and "coords" in g:
+                    recenter(g["coords"]["latitude"], g["coords"]["longitude"], "your GPS position")
+                    ss.gps_map = False
+                    st.rerun()
+                elif g and "error" in g:
+                    st.warning("Location permission denied or unavailable. Search a place instead.")
+                    ss.gps_map = False
+                else:
+                    st.info("Waiting for browser location permission…")
+            except Exception:
+                st.warning("GPS component unavailable. Search a place instead.")
                 ss.gps_map = False
-                st.rerun()
-            elif g and "error" in g:
-                st.warning("Location permission denied or unavailable. Search a place instead.")
-                ss.gps_map = False
-            else:
-                st.info("Waiting for browser location permission…")
-        except Exception:
-            st.warning("GPS component unavailable. Search a place instead.")
-            ss.gps_map = False
-    quick = lc[1].selectbox("Quick jump", ["—"] + list(db.CITIES), label_visibility="collapsed")
-    if quick != "—" and quick != ss.get("_quick_prev"):
-        ss._quick_prev = quick
-        recenter(*db.CITIES[quick][:2], quick)
-    if go and place.strip():
-        try:
-            hit = db.geocode(place.strip())
-            if hit:
-                recenter(hit["lat"], hit["lon"], hit["label"])
-            else:
-                st.warning("Could not find that place. Try a bigger city or add the country.")
-        except db.StrykeError as ex:
-            st.warning(str(ex))
-    lc[2].caption(f"Centered on: {ss.map_label}")
+        quick = lc[1].selectbox("Quick jump", ["—"] + list(db.CITIES), label_visibility="collapsed")
+        if quick != "—" and quick != ss.get("_quick_prev"):
+            ss._quick_prev = quick
+            recenter(*db.CITIES[quick][:2], quick)
+        if go and place.strip():
+            try:
+                hit = db.geocode(place.strip())
+                if hit:
+                    recenter(hit["lat"], hit["lon"], hit["label"])
+                else:
+                    st.warning("Could not find that place. Try a bigger city or add the country.")
+            except db.StrykeError as ex:
+                st.warning(str(ex))
+        lc[2].caption(f"Centered on: {ss.map_label}")
+        lat, lon = ss.map_center
+    else:
+        done, total = db.world_progress()
+        st.progress(done / total, text=f"World loaded: {done} of {total} regions · {db.count_gyms():,} gyms stored")
+        wc = st.columns([1.6, 3])
+        if done < total and wc[0].button("⬇️ Load more of the world", type="primary", use_container_width=True):
+            with st.spinner("Loading regions from OpenStreetMap (about a minute)…"):
+                _, _, failed = db.fetch_world(ss.map_center)
+            if failed:
+                st.warning("OpenStreetMap was busy. Press the button again in a minute; progress is saved.")
+            st.rerun()
+        wc[1].caption("Each press loads the regions closest to your last searched place first. Nothing is lost if you stop; "
+                      "finished regions are remembered while the database exists.")
 
-    # ---- filters
-    f = st.columns([1.2, 1.5, 1.2, 1, 1])
-    radius = f[0].slider("Radius (km)", 2, 50, 15)
+    f = st.columns([1.2, 1.6, 1.3, 1, 1, 1.1])
+    radius = f[0].slider("Radius (km)", 2, 50, 15, disabled=world)
     sports = f[1].multiselect("Martial art", db.GYM_SPORTS)
     qtxt = f[2].text_input("Name filter", placeholder="gym name…")
     pt_only = f[3].checkbox("Only gyms with PT", value=False)
-    show_coaches = f[4].checkbox("Show coaches", value=True)
+    show_coaches = f[4].checkbox("Show coaches", value=True, disabled=world)
+    style = f[5].selectbox("Map style", ["Dark", "Streets"])
 
-    lat, lon = ss.map_center
-    key = (round(lat, 2), round(lon, 2), radius)
-    if ss.last_fetch != key:
-        ss.last_fetch = key
-        try:
-            with st.spinner("Loading gyms from OpenStreetMap…"):
-                db.fetch_osm(lat, lon, radius)
-        except db.StrykeError as ex:
-            st.warning(str(ex))
-    rb = st.columns([1.4, 1.6, 3])
-    if rb[0].button("🔄 Reload this area"):
-        try:
-            with st.spinner("Reloading…"):
-                db.fetch_osm(lat, lon, radius, force=True)
-        except db.StrykeError as ex:
-            st.warning(str(ex))
+    if world:
+        gyms, coaches = db.gyms_all(sports, pt_only, qtxt), []
+        view = pdk.ViewState(latitude=25, longitude=10, zoom=1.2, pitch=0)
+    else:
+        key = (round(lat, 2), round(lon, 2), radius)
+        if ss.last_fetch != key:
+            ss.last_fetch = key
+            try:
+                with st.spinner("Loading gyms from OpenStreetMap…"):
+                    db.fetch_osm(lat, lon, radius)
+            except db.StrykeError as ex:
+                st.warning(str(ex))
+        if st.button("🔄 Reload this area"):
+            try:
+                with st.spinner("Reloading…"):
+                    db.fetch_osm(lat, lon, radius, force=True)
+            except db.StrykeError as ex:
+                st.warning(str(ex))
+        gyms = db.gyms_near(lat, lon, radius, sports, pt_only, qtxt)
+        coaches = []
+        if show_coaches:
+            coaches = [c for c in db.search_coaches(sports=[x for x in sports if x in db.SPORTS] or None)
+                       if db.haversine_km(lat, lon, c["lat"], c["lon"]) <= radius]
+        view = pdk.ViewState(latitude=lat, longitude=lon, zoom=_zoom_for(radius) - 1, pitch=0)
 
-    gyms = db.gyms_near(lat, lon, radius, sports, pt_only, qtxt)
-    coaches = []
-    if show_coaches:
-        coaches = [c for c in db.search_coaches(sports=[x for x in sports if x in db.SPORTS] or None)
-                   if db.haversine_km(lat, lon, c["lat"], c["lon"]) <= radius]
-
-    # ---- map (built once per area/filters and cached, so reruns never re-render or reset it)
-    sig = hashlib.md5(repr((
-        [(g["id"], g["name"], g["pt_status"], g["pt_price_cents"], g["currency"], len(g["logo_b64"] or ""), g["website"]) for g in gyms[:600]],
-        [(c["id"], c["price_cents"]) for c in coaches])).encode()).hexdigest()
-    m = build_map(sig, round(lat, 5), round(lon, 5), radius, _zoom_for(radius), gyms[:600], coaches)
-
-    opts = dict(key="gymmap", height=560, returned_objects=["last_object_clicked"])
+    acc = _rgb(ACCENT) + [235]
+    grey = [110, 110, 120, 220]
+    g_rows = [dict(kind="gym", id=g["id"], name=g["name"], lon=g["lon"], lat=g["lat"], pt=pt_label(g),
+                   sports=", ".join(g["sports"][:3]), color=acc if g["pt_status"] == "yes" else grey,
+                   size=9 if g["pt_status"] == "yes" else 6) for g in gyms]
+    layers = []
+    if not world:
+        layers.append(pdk.Layer("ScatterplotLayer", data=pd.DataFrame([dict(lon=lon, lat=lat)]), id="ring",
+                                get_position="[lon, lat]", get_radius=radius * 1000, radius_units="meters", filled=False,
+                                stroked=True, get_line_color=acc, line_width_min_pixels=1, pickable=False))
+    if g_rows:
+        layers.append(pdk.Layer("ScatterplotLayer", data=pd.DataFrame(g_rows), id="gyms", get_position="[lon, lat]",
+                                get_fill_color="color", get_radius="size", radius_units="pixels", stroked=True,
+                                get_line_color=[0, 0, 0, 255], line_width_min_pixels=1, pickable=True, auto_highlight=True))
+    if coaches:
+        c_rows = [dict(kind="coach", id=c["id"], name="Coach: " + c["name"], lon=c["lon"], lat=c["lat"],
+                       pt=f"{db.money(c['price_cents'], c['currency'])} / {c['session_minutes']} min",
+                       sports=", ".join(c["sports"][:3]), color=[255, 46, 99, 240], size=8) for c in coaches]
+        layers.append(pdk.Layer("ScatterplotLayer", data=pd.DataFrame(c_rows), id="coaches", get_position="[lon, lat]",
+                                get_fill_color="color", get_radius="size", radius_units="pixels", stroked=True,
+                                get_line_color=[255, 255, 255, 255], line_width_min_pixels=1, pickable=True, auto_highlight=True))
+    deck = pdk.Deck(layers=layers, initial_view_state=view, map_provider="carto", map_style="dark" if style == "Dark" else "road",
+                    tooltip={"html": "<b>{name}</b><br/>{pt}<br/>{sports}",
+                             "style": {"backgroundColor": "#141416", "color": "#F5F5F7", "fontFamily": "Inter, sans-serif"}})
     try:
-        ret = st_folium(m, use_container_width=True, **opts)
+        ev = st.pydeck_chart(deck, height=560, on_select="rerun", selection_mode="single-object", key="gymdeck")
+        objs = (ev.selection.objects if ev is not None and ev.selection else None) or {}
+        for lst in objs.values():
+            if lst:
+                ss.sel = (lst[0]["kind"], lst[0]["id"])
+                break
     except TypeError:
-        ret = st_folium(m, width=1100, **opts)
+        st.pydeck_chart(deck, height=560)
     st.markdown(f'<span class="chip acc">● PT confirmed</span><span class="chip">● PT not confirmed</span>'
                 f'<span class="chip" style="border-color:#FF2E63;color:#FF2E63">● Coach</span>'
-                f'<span class="muted"> {len(gyms)} gyms · {len(coaches)} coaches within {radius} km</span>', unsafe_allow_html=True)
-
-    if ret:
-        lc_ = ret.get("last_object_clicked")
-        if lc_:
-            best, bd = None, 0.08
-            for kind, items in (("gym", gyms), ("coach", coaches)):
-                for it in items:
-                    d = db.haversine_km(lc_["lat"], lc_["lng"], it["lat"], it["lng"])
-                    if d < bd:
-                        best, bd = (kind, it["id"]), d
-            if best:
-                ss.sel = best
+                f'<span class="muted"> {len(gyms):,} gyms'
+                f'{"" if world else f" · {len(coaches)} coaches within {radius} km"}</span>', unsafe_allow_html=True)
 
     sel = ss.sel
     if sel and sel[0] == "gym":
@@ -775,6 +773,9 @@ def page_gyms():
             st.markdown("### Selected")
             coach_card(c, "sel")
 
+    if world:
+        st.info("Zoom is limited in this view by the number of dots. For a list with logos and prices, switch to “Near a place”.")
+        return
     st.markdown("### Gyms in this area")
     if not gyms:
         st.info("No gyms found here yet. Try a larger radius, another place, or add your own gym with “List your gym”.")
@@ -914,9 +915,15 @@ def page_legal():
 
 
 header()
-{"home": page_home, "coaches": page_coaches, "profile": page_profile, "account": page_account, "dashboard": page_dashboard,
+PAGES = {"home": page_home, "coaches": page_coaches, "profile": page_profile, "account": page_account, "dashboard": page_dashboard,
  "apply": page_apply, "coach_dash": page_coach_dash, "admin": page_admin, "legal": page_legal,
- "gyms": page_gyms, "gym": page_gym, "gym_manage": page_gym_manage}.get(ss.page, page_home)()
+ "gyms": page_gyms, "gym": page_gym, "gym_manage": page_gym_manage}
+try:
+    PAGES.get(ss.page, page_home)()
+except Exception as ex:  # never leave a blank screen: show what went wrong
+    st.error("Something went wrong on this page. Press the button below or send this message to the developer.")
+    st.exception(ex)
+    st.button("Back to start", on_click=nav, args=("home",), key="errhome")
 st.divider()
 fc = st.columns([1, 1, 4])
 fc[0].button("Privacy & Terms", on_click=nav, args=("legal",), key="legal")
