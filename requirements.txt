@@ -1,4 +1,1 @@
 streamlit
-yfinance-cache
-plotly
-pandas
